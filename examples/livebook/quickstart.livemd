@@ -1,0 +1,119 @@
+# Whatsmeow Quickstart
+
+```elixir
+Mix.install([
+  {:whatsmeow_ex, "~> 0.1.0"},
+  {:kino, "~> 0.13"}
+])
+```
+
+## 1. Crypto primitives — RFC-locked
+
+The `Whatsmeow.Crypto.*` module set is a thin wrapper over Erlang's stdlib `:crypto`. All AEAD ciphers, HKDF, and Curve25519 are covered by the published RFC test vectors.
+
+```elixir
+alias Whatsmeow.Crypto.{Curve25519, HKDF, AES.GCM}
+
+# X25519 — generate a keypair, agree on a shared secret.
+{a_pub, a_priv} = Curve25519.generate_keypair()
+{b_pub, b_priv} = Curve25519.generate_keypair()
+
+shared_alice = Curve25519.agree(a_priv, b_pub)
+shared_bob = Curve25519.agree(b_priv, a_pub)
+shared_alice == shared_bob
+```
+
+```elixir
+# HKDF-SHA256 — derive 64 bytes.
+HKDF.derive("ikm", "salt", "info", 64)
+|> Base.encode16(case: :lower)
+```
+
+## 2. Binary XML codec
+
+WhatsApp's wire protocol uses a custom binary XML codec. The encoder/decoder is fully reversible.
+
+```elixir
+alias Whatsmeow.Binary
+alias Whatsmeow.Binary.Node
+
+node = %Node{
+  tag: "iq",
+  attrs: %{"type" => "set", "to" => "s.whatsapp.net"},
+  content: [%Node{tag: "ping", attrs: %{}, content: nil}]
+}
+
+encoded = Binary.encode(node)
+{:ok, decoded} = Binary.decode(encoded)
+decoded == node
+```
+
+## 3. Argo — self-describing wire format
+
+```elixir
+alias Whatsmeow.Argo
+
+payload = %{
+  "users" => [
+    %{"id" => 1, "name" => "alice"},
+    %{"id" => 2, "name" => "bob"}
+  ],
+  "count" => 2
+}
+
+encoded = Argo.encode(payload)
+{:ok, decoded, ""} = Argo.decode(encoded)
+decoded
+```
+
+## 4. AppState — LTHash
+
+```elixir
+alias Whatsmeow.AppState.LTHash
+
+base = <<0::1024>>
+
+# Apply two mutations…
+items = ["mut-1", "mut-2"]
+h1 = LTHash.add(base, items)
+
+# Removing the same items returns to baseline (commutative).
+h2 = LTHash.sub(h1, items)
+h2 == base
+```
+
+## 5. Signal Double Ratchet — 1:1 messaging
+
+```elixir
+alias Whatsmeow.Crypto.Curve25519
+alias Whatsmeow.Signal.{Session, SessionCipher}
+
+rk = :crypto.strong_rand_bytes(32)
+bob_ratchet = Curve25519.generate_keypair()
+{bob_pub, _} = bob_ratchet
+
+alice = Session.init_initiator(rk, bob_pub)
+bob = Session.init_responder(rk, bob_ratchet)
+
+{ct, _alice} = SessionCipher.encrypt(alice, "hello bob")
+SessionCipher.decrypt(bob, ct)
+```
+
+## 6. Subscribing to session events
+
+In a paired application, events fan out via `Phoenix.PubSub`:
+
+```elixir
+:ok = Whatsmeow.Notifications.subscribe("my-device-id")
+
+receive do
+  {:whatsmeow, %Whatsmeow.Types.Events.QR{code: code}} -> IO.puts(code)
+  {:whatsmeow, %Whatsmeow.Types.Events.Connected{}} -> IO.puts("connected!")
+end
+```
+
+## Next steps
+
+- Read the full module index in [HexDocs](https://hexdocs.pm/whatsmeow_ex).
+- See `examples/echo_bot/` for a CLI bot that pairs and replies.
+- Browse `plan.md` for the phased roadmap.

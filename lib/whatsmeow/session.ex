@@ -1,0 +1,1849 @@
+defmodule Whatsmeow.Session do
+  @moduledoc """
+  Per-device GenServer — owns the WebSocket, Noise cipher state, Signal
+  session cache, IQ pending map, keepalive timer, and reconnect backoff.
+
+  ## Lifecycle
+
+  ```
+      idle ──cast(:connect)──▶ connecting ──connect_ok──▶ handshaking
+        ▲                                                    │
+        │                                                    │ handshake_ok
+        │                                                    ▼
+        │                                                connected
+        │                                                    │
+        └──schedule_reconnect──── disconnected ◀──ws_closed──┘
+  ```
+
+  ## Inbound flow (post-handshake)
+
+  Mint's TLS messages land directly in this GenServer's mailbox.
+  `handle_info/2` matches `{:ssl, _, _}` / `{:tcp, _, _}` /
+  `{:ssl_closed, _}` etc. and feeds them to
+  `transport.process_message/2`. The returned WebSocket frames are
+  length-prefix-peeled, AEAD-decrypted, binary-XML-decoded, and
+  dispatched:
+
+    * `<iq><pair-device>`  → `Whatsmeow.Pair.handle_pair_device/2`
+      → broadcast `%Events.QR{}` → send `<iq type="result">` ack
+    * `<iq><pair-success>` → `Whatsmeow.Pair.handle_pair_success/2`
+      → broadcast `%Events.PairSuccess{}` → upsert device row via
+      `Whatsmeow.Store` → send `<pair-device-sign>` ack
+    * `<success>`          → `Whatsmeow.Login.parse_first_node/1`
+      → broadcast `%Events.LoggedIn{}` → schedule keepalive
+    * `<failure>`          → broadcast `%Events.LoggedOut{}` → stop
+    * `<stream:error>`     → telemetry + schedule reconnect with backoff
+    * `<iq type="result">` / `<iq type="error">` with a known `id`
+      → reply to the caller in the pending map
+    * anything else        → debug log, ignored (Phase 9 will fill the
+      `<message>` / `<receipt>` / `<notification>` slots)
+
+  ## Keepalive
+
+  Server closes idle conns at ~30 s after the last frame. The Session
+  schedules a `<iq xmlns="w:p" type="get"/>` every 20–25 s (jittered)
+  via `Process.send_after(self(), :keepalive_tick, ms)`. The IQ id is
+  parked in the pending map; the matching `<iq type="result"/>` clears
+  it. If three consecutive pings go un-acked the session forces a
+  reconnect (the lower-layer TCP rarely fails fast enough on its own).
+
+  ## Reconnect backoff
+
+  Exponential with jitter, capped at 5 min: `min(5min, 2^attempts * 1s)`
+  plus a uniform 0–500 ms jitter. Cleared on a successful `<success>`.
+  """
+
+  use GenServer
+
+  require Logger
+
+  alias Whatsmeow.Binary
+  alias Whatsmeow.IQ
+  alias Whatsmeow.Login
+  alias Whatsmeow.Pair
+  alias Whatsmeow.Store.Schemas.Device
+  alias Whatsmeow.Transport.{Frame, Handshake, NoiseHandshake, NoiseSocket}
+  alias Whatsmeow.Types.Events
+
+  # 25 s ± 2.5 s — comfortably under the server's ~30 s idle close.
+  @keepalive_base_ms 25_000
+  @keepalive_jitter_ms 2_500
+  # After 3 consecutive un-acked pings, force a reconnect.
+  @keepalive_max_consecutive_failures 3
+  # Backoff: 1s, 2s, 4s, … capped.
+  @reconnect_initial_ms 1_000
+  @reconnect_max_ms 300_000
+
+  defstruct [
+    :device_id,
+    :device,
+    :transport,
+    :transport_conn,
+    :transport_opts,
+    :noise_handshake,
+    :noise_socket,
+    :status,
+    :reconnect_attempts,
+    :reconnect_timer,
+    :keepalive_timer,
+    :keepalive_failures,
+    :auto_reconnect?,
+    # QR-ref rotation: each `<pair-device>` IQ carries 4-6 refs.
+    # The server expects the host UI to display them ONE AT A TIME,
+    # advancing on a fixed cadence (60 s for the first, 20 s for
+    # subsequent — matches Go's `qrchan.emitQRs`). Pre-Phase-15 we
+    # broadcast all refs at once, which let the LV race through them
+    # and only ever render the LAST one — so users scanned a ref the
+    # server hadn't activated yet and pair-success silently never
+    # fired. We now buffer the queue here and pop one at a time.
+    :qr_emit_queue,
+    :qr_emit_timer,
+    pending: %{}
+  ]
+
+  @type status ::
+          :idle
+          | :connecting
+          | :handshaking
+          | :pairing
+          | :connected
+          | :authenticated
+          | :disconnected
+          | :stopping
+
+  @type t :: %__MODULE__{
+          device_id: String.t(),
+          device: Device.t() | nil,
+          transport: module(),
+          transport_conn: term() | nil,
+          transport_opts: keyword(),
+          noise_handshake: NoiseHandshake.t() | nil,
+          noise_socket: NoiseSocket.t() | nil,
+          status: status(),
+          reconnect_attempts: non_neg_integer(),
+          reconnect_timer: reference() | nil,
+          keepalive_timer: reference() | nil,
+          keepalive_failures: non_neg_integer(),
+          auto_reconnect?: boolean(),
+          pending: %{optional(String.t()) => :keepalive | {pid(), reference()}}
+        }
+
+  # --- Public API -----------------------------------------------------------
+
+  @doc """
+  Start a session for `device_id`. Registers under `Whatsmeow.Sessions.Registry`.
+
+  Opts:
+
+    * `:device` — `%Device{}` (required for `connect/1` to succeed)
+    * `:transport` — module implementing `Whatsmeow.Transport.WebSocket`
+      (default: `Whatsmeow.Config.transport()`)
+    * `:transport_opts` — opts forwarded to `transport.connect/1` (e.g.
+      `[proxy: "http://…"]`)
+    * `:auto_reconnect?` — boolean (default `true`)
+  """
+  @spec start_link(keyword()) :: GenServer.on_start()
+  def start_link(opts) do
+    device_id = Keyword.fetch!(opts, :device_id)
+    GenServer.start_link(__MODULE__, opts, name: via(device_id))
+  end
+
+  @doc "Look up a running session for `device_id`."
+  @spec whereis(String.t()) :: pid() | :undefined
+  def whereis(device_id) do
+    case Registry.lookup(Whatsmeow.Sessions.Registry, device_id) do
+      [{pid, _}] -> pid
+      [] -> :undefined
+    end
+  end
+
+  @doc "Initiate a connect attempt. Will trigger the Noise handshake."
+  @spec connect(pid() | String.t()) :: :ok
+  def connect(server), do: GenServer.cast(via_or_pid(server), :connect)
+
+  @doc "Synchronous snapshot of the session's status + bookkeeping. Cheap; use freely in tests/dashboards."
+  @spec info(pid() | String.t()) :: %{
+          status: status(),
+          device_id: String.t(),
+          reconnect_attempts: non_neg_integer(),
+          keepalive_failures: non_neg_integer(),
+          pending_count: non_neg_integer()
+        }
+  def info(server), do: GenServer.call(via_or_pid(server), :info)
+
+  @doc "Send a pre-built binary-XML `Node` over the wire. Returns `:ok` or `{:error, reason}`."
+  @spec send_node(pid() | String.t(), Binary.Node.t()) :: :ok | {:error, term()}
+  def send_node(server, %Binary.Node{} = node),
+    do: GenServer.call(via_or_pid(server), {:send_node, node})
+
+  @doc """
+  Send an IQ `node` and block until the matching `<iq type="result|error">`
+  comes back, or `timeout` ms elapse.
+
+  The caller is parked in the session's pending map keyed by the
+  outbound IQ's `id`. The dispatch tree (`on_iq_response/2`) wakes the
+  caller with `{:whatsmeow_iq, ref, response_node}`; this function
+  unwraps and returns `{:ok, response}` or `{:error, :timeout}`.
+
+  Used by the Send pipeline to fetch a peer's PreKey bundle before
+  bootstrapping a Signal session.
+  """
+  @spec send_iq(pid() | String.t(), Binary.Node.t(), non_neg_integer()) ::
+          {:ok, Binary.Node.t()} | {:error, term()}
+  def send_iq(server, %Binary.Node{} = iq, timeout \\ 30_000) do
+    ref = make_ref()
+    caller = self()
+
+    case GenServer.call(via_or_pid(server), {:send_iq, iq, caller, ref}) do
+      :ok ->
+        receive do
+          {:whatsmeow_iq, ^ref, response} -> {:ok, response}
+        after
+          timeout -> {:error, :timeout}
+        end
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  @doc "Read the device record this session is bound to (or `nil`)."
+  @spec get_device(pid() | String.t()) :: {:ok, Device.t()} | {:error, :no_device}
+  def get_device(server), do: GenServer.call(via_or_pid(server), :get_device)
+
+  @doc "Stop the session (graceful)."
+  @spec stop(pid() | String.t()) :: :ok
+  def stop(server), do: GenServer.stop(via_or_pid(server), :normal)
+
+  @doc """
+  True when the session's WebSocket + Noise transport are up.
+
+  Mirrors Go's `Client.IsConnected` (`client.go`).
+  """
+  @spec connected?(pid() | String.t()) :: boolean()
+  def connected?(server) do
+    case info(server) do
+      %{status: status} -> status in [:connected, :authenticated]
+      _ -> false
+    end
+  rescue
+    _ -> false
+  catch
+    :exit, _ -> false
+  end
+
+  @doc """
+  True when the session has completed auth (`<success>` received post-Noise).
+
+  Mirrors Go's `Client.IsLoggedIn` (`client.go`).
+  """
+  @spec logged_in?(pid() | String.t()) :: boolean()
+  def logged_in?(server) do
+    case info(server) do
+      %{status: :authenticated} -> true
+      _ -> false
+    end
+  rescue
+    _ -> false
+  catch
+    :exit, _ -> false
+  end
+
+  # --- Callbacks ------------------------------------------------------------
+
+  @impl GenServer
+  def init(opts) do
+    device_id = Keyword.fetch!(opts, :device_id)
+    device = Keyword.get(opts, :device)
+    transport = Keyword.get(opts, :transport, Whatsmeow.Config.transport())
+    transport_opts = Keyword.get(opts, :transport_opts, [])
+    auto_reconnect? = Keyword.get(opts, :auto_reconnect?, true)
+
+    Process.flag(:trap_exit, true)
+
+    {:ok,
+     %__MODULE__{
+       device_id: device_id,
+       device: device,
+       transport: transport,
+       transport_opts: transport_opts,
+       status: :idle,
+       reconnect_attempts: 0,
+       keepalive_failures: 0,
+       auto_reconnect?: auto_reconnect?
+     }}
+  end
+
+  @impl GenServer
+  def handle_call(:info, _from, state) do
+    {:reply,
+     %{
+       status: state.status,
+       device_id: state.device_id,
+       reconnect_attempts: state.reconnect_attempts,
+       keepalive_failures: state.keepalive_failures,
+       pending_count: map_size(state.pending)
+     }, state}
+  end
+
+  def handle_call({:send_node, node}, _from, %__MODULE__{status: status} = state)
+      when status in [:connected, :authenticated] do
+    case do_send_node(state, node) do
+      {:ok, state2} -> {:reply, :ok, state2}
+      {:error, _} = err -> {:reply, err, state}
+    end
+  end
+
+  def handle_call({:send_node, _}, _from, state) do
+    {:reply, {:error, {:not_connected, state.status}}, state}
+  end
+
+  def handle_call(:get_device, _from, %__MODULE__{device: nil} = state) do
+    {:reply, {:error, :no_device}, state}
+  end
+
+  def handle_call(:get_device, _from, %__MODULE__{device: device} = state) do
+    {:reply, {:ok, device}, state}
+  end
+
+  def handle_call({:send_iq, iq, caller_pid, ref}, _from, %__MODULE__{status: status} = state)
+      when status in [:connected, :authenticated] do
+    id = Binary.Node.attr(iq, "id")
+    xmlns = Binary.Node.attr(iq, "xmlns")
+    iq_type = Binary.Node.attr(iq, "type")
+
+    case do_send_node(state, iq) do
+      {:ok, state2} when is_binary(id) and id != "" ->
+        Logger.debug(
+          "[whatsmeow] iq sent id=#{id} type=#{iq_type} xmlns=#{inspect(xmlns)} pending=#{map_size(state2.pending) + 1}",
+          device_id: state.device_id
+        )
+
+        pending = Map.put(state2.pending, id, {caller_pid, ref})
+        {:reply, :ok, %{state2 | pending: pending}}
+
+      {:ok, _state2} ->
+        Logger.warning("[whatsmeow] iq dropped: missing id", device_id: state.device_id)
+        {:reply, {:error, :missing_iq_id}, state}
+
+      {:error, reason} = err ->
+        Logger.error("[whatsmeow] iq wire send failed reason=#{inspect(reason)}",
+          device_id: state.device_id
+        )
+
+        {:reply, err, state}
+    end
+  end
+
+  def handle_call({:send_iq, _iq, _caller, _ref}, _from, state) do
+    Logger.warning("[whatsmeow] iq rejected: session #{state.status}",
+      device_id: state.device_id
+    )
+
+    {:reply, {:error, {:not_connected, state.status}}, state}
+  end
+
+  @impl GenServer
+  def handle_cast(:connect, %__MODULE__{device: nil} = state) do
+    Logger.warning("[whatsmeow] connect requested but no device on state; ignoring",
+      device_id: state.device_id
+    )
+
+    {:noreply, state}
+  end
+
+  # In-progress states: another `:connect` cast lands when the LV or
+  # Autostart races a re-pair click. Treat as no-op — opening a fresh
+  # socket would orphan the in-flight one, and any `<pair-device>` IQ
+  # already in our mailbox would belong to the old conn and get dropped
+  # by `transport.process_message/2` (returns `:unknown` for messages
+  # from a different socket). That's the bug that made QR events
+  # disappear in the LV when users clicked Connect a second time.
+  def handle_cast(:connect, %__MODULE__{status: status} = state)
+      when status in [:connecting, :handshaking, :pairing, :connected, :authenticated] do
+    Logger.debug("[whatsmeow] :connect cast received while #{status} — ignoring",
+      device_id: state.device_id
+    )
+
+    {:noreply, state}
+  end
+
+  def handle_cast(:connect, %__MODULE__{status: :idle} = state) do
+    case cold_start_jitter_ms() do
+      0 ->
+        do_connect(state)
+
+      max ->
+        delay = :rand.uniform(max)
+
+        Logger.debug("[whatsmeow] cold-start jitter",
+          device_id: state.device_id,
+          delay_ms: delay
+        )
+
+        Process.send_after(self(), :connect_after_cold_start, delay)
+        {:noreply, state}
+    end
+  end
+
+  # `:disconnected`, `:stopping`, or any future state — fresh connect.
+  def handle_cast(:connect, %__MODULE__{} = state), do: do_connect(state)
+
+  defp do_connect(%__MODULE__{} = state) do
+    :telemetry.execute(
+      [:whatsmeow, :session, :connect, :start],
+      %{system_time: System.system_time()},
+      %{device_id: state.device_id, attempt: state.reconnect_attempts}
+    )
+
+    Logger.info("[whatsmeow] connecting", device_id: state.device_id)
+    state = %{state | status: :connecting}
+
+    with {:ok, conn} <- state.transport.connect(state.transport_opts),
+         state = %{state | status: :handshaking, transport_conn: conn},
+         {:ok, conn, ns} <-
+           Handshake.run(transport: state.transport, conn: conn, device: state.device) do
+      Logger.info("[whatsmeow] handshake complete", device_id: state.device_id)
+
+      :telemetry.execute(
+        [:whatsmeow, :session, :connect, :stop],
+        %{system_time: System.system_time()},
+        %{device_id: state.device_id, outcome: :ok}
+      )
+
+      Whatsmeow.Notifications.broadcast(state.device_id, %Events.Connected{
+        device_id: state.device_id
+      })
+
+      state = %{
+        state
+        | transport_conn: conn,
+          noise_socket: ns,
+          status: :connected,
+          reconnect_attempts: 0,
+          keepalive_failures: 0
+      }
+
+      # CRITICAL: keepalive must run from the moment the handshake
+      # completes, NOT just after `<success>`. Upstream Go starts
+      # `keepAliveLoop` immediately after `doHandshake` returns
+      # (`client.go:560`). On a fresh device this gap is the entire
+      # pairing window — the server sits there sending pair-device
+      # IQs every ~20 s and expects `<iq xmlns="w:p" type="get"/>`
+      # pings back. With no pings, the server tears the socket down
+      # after ~30 s of one-way traffic and the user never sees
+      # `<pair-success>` even though they scanned in time.
+      state = schedule_keepalive(state)
+
+      # CRITICAL: drain any frames that arrived in the same TCP segment
+      # as the final handshake response. Mint's WS decoder returns ALL
+      # frames in that segment; `Handshake.run` only consumes the ones
+      # it needs and the rest sit in `transport_conn.buffer`. Without
+      # this drain, an immediately-following `<iq><pair-device>` IQ is
+      # stranded — the next `:ssl` message won't arrive until we ack
+      # pair-device, but we never see it because nothing dispatched the
+      # buffered frame. This deadlock was the actual reason QR codes
+      # never appeared in the Session path even though the smoke task
+      # (synchronous `recv` loop that drains buffer-first) worked fine.
+      drain_buffered_frames(state)
+    else
+      err ->
+        # Reason inlined in the message body — the default Logger
+        # formatter strips `:metadata` for everything except
+        # `:request_id`, which made the old "connect failed" line a
+        # mystery in production logs.
+        Logger.error(
+          "[whatsmeow] connect failed reason=#{inspect(err, limit: 6, printable_limit: 200)}",
+          device_id: state.device_id
+        )
+
+        :telemetry.execute(
+          [:whatsmeow, :session, :connect, :stop],
+          %{system_time: System.system_time()},
+          %{device_id: state.device_id, outcome: :failed, reason: err}
+        )
+
+        {:noreply, schedule_reconnect(%{state | status: :disconnected})}
+    end
+  end
+
+  # Pop any frames buffered in `transport_conn` and dispatch them
+  # through the normal pipeline. Mint's WS decoder may return multiple
+  # frames in a single `:ssl` message; `Handshake.run` only consumes
+  # what it needs and leaves the rest in `transport_conn.buffer`. This
+  # is invariant across transports — the `Whatsmeow.Transport.WebSocket`
+  # behaviour exposes a `buffer` field on the conn struct.
+  defp drain_buffered_frames(%__MODULE__{transport_conn: conn} = state) do
+    case Map.get(conn, :buffer, []) do
+      [] ->
+        {:noreply, state}
+
+      buffered when is_list(buffered) ->
+        Logger.debug("[whatsmeow] draining #{length(buffered)} post-handshake frames",
+          device_id: state.device_id
+        )
+
+        cleared_conn = %{conn | buffer: []}
+        state = %{state | transport_conn: cleared_conn}
+        process_ws_frames(state, buffered)
+    end
+  end
+
+  # --- handle_info ---------------------------------------------------------
+
+  @impl GenServer
+  def handle_info(:connect_after_cold_start, %__MODULE__{status: :idle} = state),
+    do: do_connect(state)
+
+  def handle_info(:connect_after_cold_start, state) do
+    # State already moved past :idle (e.g. user called connect/1 again, or stop).
+    {:noreply, state}
+  end
+
+  def handle_info(:keepalive_tick, %__MODULE__{status: status} = state)
+      when status in [:connected, :authenticated, :pairing] do
+    case send_keepalive(state) do
+      {:ok, state2} ->
+        {:noreply, schedule_keepalive(state2)}
+
+      {:error, reason} ->
+        Logger.warning("[whatsmeow] keepalive send failed",
+          device_id: state.device_id,
+          reason: inspect(reason)
+        )
+
+        {:noreply, schedule_keepalive(bump_keepalive_failure(state))}
+    end
+  end
+
+  def handle_info(:keepalive_tick, state) do
+    # Not connected — drop the tick; will be rescheduled on next connect.
+    {:noreply, %{state | keepalive_timer: nil}}
+  end
+
+  def handle_info({:reconnect, attempt}, %__MODULE__{reconnect_attempts: attempt} = state) do
+    Logger.info("[whatsmeow] reconnect attempt", device_id: state.device_id, attempt: attempt)
+    handle_cast(:connect, %{state | reconnect_timer: nil})
+  end
+
+  def handle_info({:reconnect, _stale}, state) do
+    # Newer attempt scheduled; drop the stale firing.
+    {:noreply, state}
+  end
+
+  # Pop the next QR ref from the queue, broadcast it to subscribers,
+  # and schedule the following one. When the queue empties we just
+  # park — a new `<pair-device>` IQ from the server will refill it.
+  def handle_info(:emit_next_qr, %__MODULE__{qr_emit_queue: queue} = state)
+      when is_list(queue) and queue != [] do
+    [next_ref | rest] = queue
+    broadcast_qr(state, next_ref)
+
+    state = %{state | qr_emit_queue: rest, qr_emit_timer: nil}
+
+    state =
+      if rest == [] do
+        state
+      else
+        ms = qr_ref_timeout_ms(length(rest) + 1, :rest)
+        ref = Process.send_after(self(), :emit_next_qr, ms)
+        %{state | qr_emit_timer: ref}
+      end
+
+    {:noreply, state}
+  end
+
+  def handle_info(:emit_next_qr, state), do: {:noreply, state}
+
+  def handle_info({:EXIT, _, _reason}, state), do: {:noreply, state}
+
+  def handle_info(:post_login_bootstrap, %__MODULE__{status: :authenticated} = state) do
+    # Send the post-login set-passive(false) + presence. The server
+    # quietly drops idle sessions if these don't show up shortly after
+    # <success>. Mirrors Go's `SetPassive` + `SendPresence` calls in
+    # `whatsmeow-main/connectionevents.go`.
+    state =
+      state
+      |> send_node_or_log(IQ.build_set_passive(false), "active IQ")
+      |> send_node_or_log(
+        IQ.build_presence(:available, push_name(state.device)),
+        "presence"
+      )
+
+    # Kick off async PreKey upload — runs in its own Task so the
+    # blocking IQ round-trip doesn't stall the Session mailbox.
+    server = self()
+    initial? = needs_initial_prekey_upload?(state.device)
+
+    _ =
+      Task.Supervisor.start_child(Whatsmeow.Media.TaskSup, fn ->
+        do_post_login_prekey_upload(server, initial?)
+      end)
+
+    {:noreply, state}
+  end
+
+  def handle_info(:post_login_bootstrap, state) do
+    # Status changed before we got around to it — drop silently.
+    {:noreply, state}
+  end
+
+  def handle_info(msg, %__MODULE__{transport: transport, transport_conn: conn} = state)
+      when not is_nil(conn) do
+    case transport.process_message(conn, msg) do
+      {:ok, conn, frames} ->
+        process_ws_frames(%{state | transport_conn: conn}, frames)
+
+      :closed ->
+        Logger.info("[whatsmeow] websocket closed by server", device_id: state.device_id)
+        {:noreply, handle_disconnect(state, :closed)}
+
+      :unknown ->
+        # Not a Mint message for our conn — ignore (lets other transports
+        # share the mailbox if needed, and avoids crashing on stray msgs).
+        {:noreply, state}
+
+      {:error, reason} ->
+        Logger.warning("[whatsmeow] transport error",
+          device_id: state.device_id,
+          reason: inspect(reason)
+        )
+
+        {:noreply, handle_disconnect(state, {:transport, reason})}
+    end
+  end
+
+  def handle_info(_msg, state), do: {:noreply, state}
+
+  @impl GenServer
+  def terminate(_reason, %__MODULE__{transport_conn: nil}), do: :ok
+
+  def terminate(_reason, %__MODULE__{transport: transport, transport_conn: conn}) do
+    _ = transport.close(conn)
+    :ok
+  end
+
+  # --- frame → IQ dispatch -------------------------------------------------
+
+  defp process_ws_frames(state, []), do: {:noreply, state}
+
+  defp process_ws_frames(state, [ws_payload | rest]) do
+    {framed, _rest_bytes} = Frame.read_frames(ws_payload)
+
+    state = Enum.reduce(framed, state, &decrypt_and_dispatch/2)
+
+    case state.status do
+      :stopping -> {:stop, :normal, state}
+      _ -> process_ws_frames(state, rest)
+    end
+  end
+
+  defp decrypt_and_dispatch(ciphertext, %__MODULE__{noise_socket: ns} = state) do
+    case NoiseSocket.decrypt(ns, ciphertext) do
+      {:ok, plain, ns2} ->
+        case unpack_and_decode(plain) do
+          {:ok, %Binary.Node{} = node} ->
+            dispatch_node(%{state | noise_socket: ns2}, node)
+
+          {:error, reason} ->
+            Logger.warning("[whatsmeow] binary-decode failed",
+              device_id: state.device_id,
+              reason: inspect(reason)
+            )
+
+            %{state | noise_socket: ns2}
+        end
+
+      {:error, :auth_failed} ->
+        Logger.error("[whatsmeow] AEAD auth failed mid-stream — counter drift",
+          device_id: state.device_id
+        )
+
+        handle_disconnect(state, :aead_auth_failed)
+    end
+  end
+
+  defp dispatch_node(state, %Binary.Node{tag: "iq"} = iq) do
+    cond do
+      Binary.Node.get_child(iq, "pair-device") != nil ->
+        on_pair_device(state, iq)
+
+      Binary.Node.get_child(iq, "pair-success") != nil ->
+        on_pair_success(state, iq)
+
+      Binary.Node.attr(iq, "type") in ["result", "error"] ->
+        on_iq_response(state, iq)
+
+      # Server-initiated `<iq type="get"><ping/></iq>` and similar
+      # liveness probes. Reply with a bare `<iq type="result">` echoing
+      # the request id — same shape the upstream Go client and our
+      # smoke task use. Without this the server escalates to a TCP
+      # close after the keepalive deadline. We only reply when an `id`
+      # attribute is present (an empty id triggers a `<stream:error>`).
+      Binary.Node.attr(iq, "type") == "get" ->
+        on_server_iq_get(state, iq)
+
+      true ->
+        # Anything else: log + ignore. Upstream Go also silently drops
+        # unknown server-initiated iqs (`handleIQ` in pair.go only
+        # branches on `pair-device` / `pair-success`). Sending a
+        # generic ack here was confusing the server with malformed
+        # replies and made things worse.
+        log_unhandled_iq(state, iq)
+        state
+    end
+  end
+
+  defp dispatch_node(state, %Binary.Node{tag: "success"} = node) do
+    on_success(state, node)
+  end
+
+  defp dispatch_node(state, %Binary.Node{tag: "failure"} = node) do
+    on_failure(state, node)
+  end
+
+  defp dispatch_node(state, %Binary.Node{tag: "stream:error"} = node) do
+    on_stream_error(state, node)
+  end
+
+  defp dispatch_node(state, %Binary.Node{tag: "xmlstreamend"}) do
+    handle_disconnect(state, :stream_end)
+  end
+
+  # `<ib>` = "info broadcast" — server-pushed config (offline-sync
+  # preview, dirty state, edge-routing hints, downgrade hints). Mirrors
+  # upstream Go's `handleIB` in `connectionevents.go`: walks the
+  # children and dispatches typed events for the ones we care about,
+  # silently ignoring the rest. No ack required at protocol level.
+  defp dispatch_node(state, %Binary.Node{tag: "ib"} = node) do
+    on_ib(state, node)
+  end
+
+  defp dispatch_node(state, %Binary.Node{tag: "message"} = msg) do
+    on_message(state, msg)
+  end
+
+  defp dispatch_node(state, %Binary.Node{tag: "receipt"} = node) do
+    receipt = Whatsmeow.Receipt.from_node(state.device_id, node)
+
+    if receipt do
+      Logger.info(
+        "[whatsmeow] receipt in type=#{inspect(receipt.type)} ids=#{inspect(receipt.message_ids)} from=#{inspect(receipt.from)}",
+        device_id: state.device_id
+      )
+
+      Whatsmeow.Notifications.broadcast(state.device_id, receipt)
+    end
+
+    ack = Whatsmeow.Receipt.build_ack(node)
+    {:ok, state2} = do_send_node(state, ack) |> ok_or_keep(state)
+    state2
+  end
+
+  defp dispatch_node(state, %Binary.Node{tag: "notification"} = node) do
+    # Some `<notification>` flavours carry data we want to persist
+    # before we ack. The big one is `type="devices"` — it announces
+    # LID ↔ phone pairings as peers add/remove linked devices. Without
+    # snarfing these into `whatsmeow_lid_map`, every privacy-LID peer
+    # arrives at the chatbot as an anonymous LID and the agent has to
+    # ask "who are you?" even when we already know them by phone.
+    _ = maybe_persist_lid_map(node)
+
+    ack = Whatsmeow.Receipt.build_ack(node)
+    {:ok, state2} = do_send_node(state, ack) |> ok_or_keep(state)
+    state2
+  end
+
+  defp dispatch_node(state, %Binary.Node{tag: "call"} = node) do
+    ack = Whatsmeow.Receipt.build_ack(node)
+    {:ok, state2} = do_send_node(state, ack) |> ok_or_keep(state)
+    state2
+  end
+
+  defp dispatch_node(state, %Binary.Node{tag: tag} = node) do
+    # Inline the tag + node skeleton in the message — the default dev
+    # logger formatter drops keyword metadata, which made silent-drop
+    # diagnostics impossible (IQ responses got lost here without anyone
+    # seeing which tag was on the wire).
+    attrs_preview =
+      case node do
+        %Binary.Node{attrs: %{} = a} ->
+          a |> Enum.take(5) |> Enum.map_join(",", fn {k, v} -> "#{k}=#{inspect(v)}" end)
+
+        _ ->
+          ""
+      end
+
+    Logger.debug(
+      "[whatsmeow] unhandled inbound tag=#{tag} attrs=#{attrs_preview}",
+      device_id: state.device_id
+    )
+
+    state
+  end
+
+  # --- <message> dispatch ---------------------------------------------------
+
+  defp on_message(state, %Binary.Node{} = msg) do
+    own_jid = own_jid(state.device)
+
+    case Whatsmeow.MessageInfo.from_node(msg, own_jid) do
+      {:ok, info} ->
+        # Always ack first so the server doesn't resend on a slow decrypt.
+        ack = Whatsmeow.Receipt.build_ack(msg)
+        {:ok, state} = do_send_node(state, ack) |> ok_or_keep(state)
+
+        case try_decrypt_and_broadcast(state, msg, info) do
+          :ok ->
+            # Always send the delivery receipt (double grey tick). The
+            # READ receipt (double blue tick — "seen") is gated by the
+            # host application via `:send_read_receipts` config. Hosts
+            # that want the same privacy semantics as WhatsApp's
+            # "Read receipts: off" setting can disable it without
+            # affecting delivery confirmations.
+            delivery = Whatsmeow.Receipt.build_delivery_receipt(msg)
+            {:ok, state2} = do_send_node(state, delivery) |> ok_or_keep(state)
+
+            state3 =
+              if Application.get_env(:whatsmeow_ex, :send_read_receipts, true) do
+                read = Whatsmeow.Receipt.build_read_receipt(msg)
+                {:ok, s} = do_send_node(state2, read) |> ok_or_keep(state2)
+                s
+              else
+                state2
+              end
+
+            state3
+
+          {:retry, reason} ->
+            # Signal-level decrypt failure. Mirrors Go's `sendRetryReceipt`
+            # (`whatsmeow-main/retry.go:465`):
+            #
+            #   • Track the retry count per message id. After 5 attempts
+            #     give up (peer's client is broken / message lost).
+            #   • count == 1 → JUST `<retry/>` + `<registration/>`. No
+            #     `<keys>` block. Go also fires `requestMessageFromPhone`
+            #     here, asking the peer's PRIMARY device to re-send via
+            #     the multi-device fanout path. We skip that for now —
+            #     it requires the peer's app-state to be in sync.
+            #   • count >= 2 → INCLUDE `<keys>` so the peer can do a
+            #     fresh X3DH against our identity.
+            #
+            # The old code sent `count: 1` AND keys on every retry,
+            # which the peer's libsignal apparently silently ignored —
+            # they kept replaying the same stale ciphertext forever
+            # because they never got "permission" to drop their session.
+            msg_id = Whatsmeow.Binary.Node.attr(msg, "id")
+            count = bump_retry_count(msg_id)
+
+            if count > 5 do
+              Logger.warning(
+                "[whatsmeow] retry receipt cap reached id=#{msg_id} — abandoning",
+                device_id: state.device_id
+              )
+
+              state
+            else
+              keys =
+                if count >= 2,
+                  do: build_retry_keys_tuple(state.device),
+                  else: nil
+
+              Logger.debug(
+                "[whatsmeow] sending retry receipt count=#{count} reason=#{inspect(reason)} id=#{msg_id}"
+              )
+
+              retry =
+                Whatsmeow.Receipt.build_retry_receipt(msg,
+                  count: count,
+                  registration_id: state.device.registration_id,
+                  keys: keys
+                )
+
+              {:ok, state2} = do_send_node(state, retry) |> ok_or_keep(state)
+
+              # On first failure, ALSO ask our primary phone to
+              # re-forward the message via `PEER_DATA_OPERATION_REQUEST`.
+              # The retry-receipt asks the SENDER to re-encrypt; this
+              # peer-message asks OUR OWN primary phone to re-forward
+              # the message it already has decrypted in its history.
+              # Either path can recover the missed message — fire both
+              # so we maximise chances of getting the content.
+              # Mirrors Go's `delayedRequestMessageFromPhone`
+              # (`whatsmeow-main/retry.go:417`).
+              if count == 1, do: request_message_from_phone(state2, info)
+
+              state2
+            end
+
+          :no_decrypt ->
+            state
+        end
+
+      {:error, reason} ->
+        Logger.warning("[whatsmeow] inbound <message> rejected",
+          device_id: state.device_id,
+          reason: inspect(reason)
+        )
+
+        # Nack with code 1 so the server still stops resending.
+        ack = Whatsmeow.Receipt.build_ack(msg, 1)
+        {:ok, state2} = do_send_node(state, ack) |> ok_or_keep(state)
+        state2
+    end
+  end
+
+  # Returns :ok on successful decrypt + Events.Message broadcast,
+  # :no_decrypt when we surfaced an UndecryptableMessage instead (so the
+  # caller skips the post-decrypt <receipt>).
+  defp try_decrypt_and_broadcast(state, %Binary.Node{} = msg, info) do
+    case Whatsmeow.Signal.Decrypt.decrypt_message_node(msg, state.device, info) do
+      {:ok, %{plaintext: plain}} ->
+        case Whatsmeow.Signal.MessageBuilder.from_plaintext(plain, info) do
+          {:ok, typed_msg, attachments} ->
+            Whatsmeow.Notifications.broadcast(state.device_id, %Events.Message{
+              device_id: state.device_id,
+              message: typed_msg,
+              info: info
+            })
+
+            Enum.each(attachments, fn descriptor ->
+              Whatsmeow.Notifications.broadcast(state.device_id, %Events.MediaMessage{
+                device_id: state.device_id,
+                info: info,
+                message: typed_msg,
+                descriptor: descriptor,
+                kind: descriptor.kind
+              })
+            end)
+
+            :telemetry.execute(
+              [:whatsmeow, :session, :message_decrypted],
+              %{system_time: System.system_time(), plaintext_bytes: byte_size(plain)},
+              %{
+                device_id: state.device_id,
+                from: info.from,
+                attachments: length(attachments)
+              }
+            )
+
+            :ok
+
+          {:error, reason} ->
+            Logger.warning("[whatsmeow] WaE2E.Message decode failed",
+              device_id: state.device_id,
+              reason: inspect(reason)
+            )
+
+            broadcast_undecryptable(state, msg, info, reason)
+            :no_decrypt
+        end
+
+      {:error, reason} ->
+        # Signal-layer decrypt failure — surface as `UndecryptableMessage`
+        # AND tell the caller to send a `<receipt type="retry">` so the
+        # peer drops its stale session and re-bootstraps. Returning
+        # `{:retry, reason}` (not `:no_decrypt`) is what distinguishes a
+        # recoverable Signal mismatch from an unrecoverable plaintext
+        # decode error.
+        broadcast_undecryptable(state, msg, info, reason)
+        {:retry, reason}
+    end
+  end
+
+  # Snarf any LID ↔ phone pairings out of a `<notification>` and
+  # persist them to `whatsmeow_lid_map`. WhatsApp announces these
+  # pairings whenever a peer adds / removes a linked device or our
+  # device first learns about them. Without persisting, every
+  # privacy-LID peer stays anonymous to us forever and downstream
+  # patient resolution (Imdent.WhatsApp.Inbox.lookup_patient_id)
+  # falls back to "I don't know who you are".
+  #
+  # Shape (per WhatsApp's multi-device protocol):
+  #   <notification type="devices" from="<phone_jid>" lid="<lid_jid>">
+  #     <add ...><device jid="<phone_jid>:N" lid="<lid>:N"/></add>
+  #     ...
+  #   </notification>
+  defp maybe_persist_lid_map(%Binary.Node{tag: "notification", attrs: attrs} = node) do
+    case Map.get(attrs, "type") do
+      "devices" ->
+        from = Map.get(attrs, "from")
+        lid = Map.get(attrs, "lid")
+
+        # Top-level pairing (the peer's primary phone ↔ primary LID).
+        _ = persist_lid_pn(lid, from)
+
+        # Per-device pairings inside `<add>` / `<remove>` / `<update>`.
+        node
+        |> Binary.Node.children()
+        |> List.wrap()
+        |> Enum.each(fn child ->
+          child
+          |> Binary.Node.get_children("device")
+          |> Enum.each(fn dev ->
+            d_jid = Binary.Node.attr(dev, "jid")
+            d_lid = Binary.Node.attr(dev, "lid")
+            _ = persist_lid_pn(d_lid, d_jid)
+          end)
+        end)
+
+        :ok
+
+      _ ->
+        :ok
+    end
+  rescue
+    _ -> :ok
+  end
+
+  defp maybe_persist_lid_map(_), do: :ok
+
+  defp persist_lid_pn(lid, pn) when is_binary(lid) and is_binary(pn) and lid != "" and pn != "" do
+    repo = Whatsmeow.Repo
+
+    if Code.ensure_loaded?(repo) and is_pid(Process.whereis(repo)) do
+      # Upsert; conflict-target is the LID column. `pn` is pinned via
+      # parameter — no string interpolation, so the Iron Law lint flag
+      # is a false positive (this is transport-layer code).
+      _ =
+        Ecto.Adapters.SQL.query(
+          repo,
+          "INSERT INTO whatsmeow_lid_map (lid, pn) VALUES ($1, $2) " <>
+            "ON CONFLICT (lid) DO UPDATE SET pn = EXCLUDED.pn",
+          [lid, pn]
+        )
+    end
+
+    :ok
+  rescue
+    _ -> :ok
+  end
+
+  defp persist_lid_pn(_, _), do: :ok
+
+  # Ask our PRIMARY phone (the device that paired us) to re-forward a
+  # message our companion failed to decrypt. Runs as a fire-and-forget
+  # `Task.start` so a slow IQ round-trip doesn't stall the receive
+  # loop. Errors are intentionally swallowed — at worst the retry
+  # receipt still works.
+  defp request_message_from_phone(_state, nil), do: :ok
+
+  defp request_message_from_phone(state, %Whatsmeow.MessageInfo{} = info) do
+    server = self()
+    chat = info.from
+    sender = info.from
+    msg_id = info.id
+
+    Task.Supervisor.start_child(Whatsmeow.Media.TaskSup, fn ->
+      try do
+        peer_msg = Whatsmeow.Send.build_unavailable_message_request(chat, sender, msg_id)
+
+        case Whatsmeow.Send.send_peer_message(server, peer_msg) do
+          {:ok, peer_msg_id} ->
+            Logger.debug(
+              "[whatsmeow] requested missing message from phone — id=#{msg_id} peer_msg_id=#{peer_msg_id}",
+              device_id: state.device_id
+            )
+
+          {:error, reason} ->
+            Logger.debug(
+              "[whatsmeow] peer-message request failed for #{msg_id}: #{inspect(reason)}",
+              device_id: state.device_id
+            )
+        end
+      rescue
+        e ->
+          Logger.debug(
+            "[whatsmeow] peer-message request crashed for #{msg_id}: #{Exception.message(e)}",
+            device_id: state.device_id
+          )
+      end
+    end)
+
+    :ok
+  end
+
+  # Per-message-id retry counter. Lives in a public named ETS table so
+  # the count survives the next inbound (the same `<message id>` may
+  # arrive multiple times — server replays until we successfully
+  # decrypt). Initialised lazily on first use. Mirrors Go's
+  # `cli.messageRetries` map.
+  @retry_count_table :whatsmeow_message_retries
+
+  defp bump_retry_count(nil), do: 1
+
+  defp bump_retry_count(msg_id) when is_binary(msg_id) do
+    case :ets.info(@retry_count_table) do
+      :undefined ->
+        _ = :ets.new(@retry_count_table, [:public, :named_table, :set])
+        :ok
+
+      _ ->
+        :ok
+    end
+
+    :ets.update_counter(@retry_count_table, msg_id, {2, 1}, {msg_id, 0})
+  end
+
+  # Build the 4-tuple consumed by `Whatsmeow.Receipt.build_retry_receipt`'s
+  # `:keys` option. The tuple is
+  #   {identity_pub, signed_prekey_node, prekey_node, device_identity_bytes}
+  # and is rendered as the `<keys>` child of the retry receipt — the
+  # bundle the peer needs to re-derive X3DH against our fresh identity
+  # without an extra server round-trip. Picks an unused OPK from our
+  # pool (generating one on the fly if the pool is empty). On any error
+  # we return `nil` so the retry receipt is sent WITHOUT keys (still
+  # better than no retry at all).
+  defp build_retry_keys_tuple(%Whatsmeow.Store.Schemas.Device{} = device) do
+    identity_pub = Whatsmeow.Crypto.Curve25519.public_for(device.identity_key)
+
+    signed_prekey_pub =
+      Whatsmeow.Crypto.Curve25519.public_for(device.signed_pre_key)
+
+    signed_prekey_node =
+      Whatsmeow.PreKeys.signed_pre_key_node(
+        device.signed_pre_key_id,
+        signed_prekey_pub,
+        device.signed_pre_key_sig
+      )
+
+    prekey_node =
+      case Whatsmeow.PreKeys.get_or_generate(device.jid, 1) do
+        {:ok, [prekey | _]} -> Whatsmeow.PreKeys.prekey_to_node(prekey)
+        _ -> nil
+      end
+
+    device_identity_bytes =
+      %WAAdv.ADVSignedDeviceIdentity{
+        details: device.adv_details,
+        accountSignature: device.adv_account_sig,
+        accountSignatureKey: device.adv_account_sig_key,
+        deviceSignature: device.adv_device_sig
+      }
+      |> WAAdv.ADVSignedDeviceIdentity.encode()
+      |> IO.iodata_to_binary()
+
+    if is_nil(prekey_node) do
+      nil
+    else
+      {identity_pub, signed_prekey_node, prekey_node, device_identity_bytes}
+    end
+  rescue
+    e ->
+      Logger.warning("[whatsmeow] build_retry_keys_tuple failed: #{Exception.message(e)}")
+      nil
+  end
+
+  defp broadcast_undecryptable(state, %Binary.Node{} = msg, info, reason) do
+    enc_children = Binary.Node.get_children(msg, "enc")
+
+    Enum.each(enc_children, fn enc ->
+      Whatsmeow.Notifications.broadcast(state.device_id, %Events.UndecryptableMessage{
+        device_id: state.device_id,
+        info: info,
+        reason: undecryptable_reason(reason),
+        enc_type: Binary.Node.attr(enc, "type"),
+        enc_version: Binary.Node.attr(enc, "v"),
+        enc_payload: enc.content
+      })
+    end)
+
+    :telemetry.execute(
+      [:whatsmeow, :session, :message_undecryptable],
+      %{system_time: System.system_time(), enc_count: length(enc_children)},
+      %{device_id: state.device_id, from: info.from, reason: undecryptable_reason(reason)}
+    )
+
+    :ok
+  end
+
+  defp undecryptable_reason(:no_session), do: :no_session
+  defp undecryptable_reason(:no_identity_pub), do: :no_identity_pub
+  defp undecryptable_reason(:no_repo), do: :no_repo
+  defp undecryptable_reason(:no_enc), do: :no_enc
+  defp undecryptable_reason(:mac_mismatch), do: :mac_mismatch
+  defp undecryptable_reason(:bad_padding), do: :bad_padding
+  defp undecryptable_reason(:missing_prekey), do: :missing_prekey
+  defp undecryptable_reason(:no_group_session), do: :no_group_session
+  defp undecryptable_reason(:no_chat), do: :no_chat
+  defp undecryptable_reason(:no_sender), do: :no_sender
+  defp undecryptable_reason(:bad_signature), do: :bad_signature
+  defp undecryptable_reason(:duplicate_message), do: :duplicate_message
+  defp undecryptable_reason(:iteration_too_far_ahead), do: :iteration_too_far_ahead
+  defp undecryptable_reason({:proto_decode, _}), do: :proto_decode
+  defp undecryptable_reason({:wire_decode, _}), do: :wire_decode
+  defp undecryptable_reason({:aes, _}), do: :aes
+  defp undecryptable_reason({:crash, _}), do: :crash
+  defp undecryptable_reason(_), do: :no_signal_wire_proto
+
+  defp own_jid(%Device{jid: jid}) when is_binary(jid) do
+    case Whatsmeow.Types.JID.parse(jid) do
+      {:ok, j} -> j
+      _ -> nil
+    end
+  end
+
+  defp own_jid(_), do: nil
+
+  # --- pair-device → QR ----------------------------------------------------
+
+  # Each `<pair-device>` IQ carries 4-6 ref strings, each pre-issued
+  # by the server with its own activation window. Upstream Go's
+  # `emitQRs` (qrchan.go:62) emits them ONE AT A TIME with a 60 s wait
+  # for the first and 20 s for the rest — so the host UI rotates
+  # through them in step with the server's expectations. If we
+  # broadcast them all at once (the previous behavior) the LV's
+  # `qr_code_base64` is overwritten N times in milliseconds and only
+  # the LAST ref is ever rendered; the user scans an "early" ref the
+  # server hasn't activated yet, and pair-success silently never fires.
+  defp on_pair_device(state, iq) do
+    refs = Pair.handle_pair_device(iq, state.device)
+
+    # ACK the IQ first (matches upstream Go's ordering — pair.go:51).
+    ack = Pair.build_pair_device_ack(iq)
+    {:ok, state2} = do_send_node(state, ack) |> ok_or_keep(state)
+
+    state2
+    |> Map.put(:status, :pairing)
+    |> start_qr_emitter(refs)
+  end
+
+  # Replace any in-flight QR emitter with one driven by the latest
+  # ref batch. The new pair-device IQ supersedes the old refs, so any
+  # pending `:emit_next_qr` timer must be cancelled first.
+  defp start_qr_emitter(state, []), do: state
+
+  defp start_qr_emitter(state, [first_ref | rest]) do
+    state =
+      state
+      |> cancel_qr_emit_timer()
+      |> Map.put(:qr_emit_queue, rest)
+
+    broadcast_qr(state, first_ref)
+
+    if rest == [] do
+      %{state | qr_emit_timer: nil}
+    else
+      ms = qr_ref_timeout_ms(length([first_ref | rest]), :first)
+      ref = Process.send_after(self(), :emit_next_qr, ms)
+      %{state | qr_emit_timer: ref}
+    end
+  end
+
+  defp cancel_qr_emit_timer(%__MODULE__{qr_emit_timer: ref} = state) when is_reference(ref) do
+    _ = Process.cancel_timer(ref)
+    %{state | qr_emit_timer: nil}
+  end
+
+  defp cancel_qr_emit_timer(state), do: state
+
+  defp broadcast_qr(state, payload) do
+    Whatsmeow.Notifications.broadcast(state.device_id, %Events.QR{
+      device_id: state.device_id,
+      code: payload
+    })
+  end
+
+  # Upstream timing (qrchan.go:80): the first ref of a 6-ref batch
+  # gets a 60 s window; subsequent refs get 20 s. Smaller batches use
+  # 20 s for every ref.
+  defp qr_ref_timeout_ms(6, :first), do: 60_000
+  defp qr_ref_timeout_ms(_, _), do: 20_000
+
+  # --- pair-success → device-sig + ack -------------------------------------
+
+  defp on_pair_success(state, iq) do
+    case Pair.handle_pair_success(iq, state.device) do
+      {:ok, %Pair.Result{} = result} ->
+        :telemetry.execute(
+          [:whatsmeow, :session, :pair_success],
+          %{system_time: System.system_time()},
+          %{device_id: state.device_id, jid: result.jid}
+        )
+
+        # Persist if the store is reachable; tolerate absent Repo (tests).
+        _ = maybe_persist_device(result.device)
+
+        # Update in-memory device so the next reconnect uses login_payload.
+        state = %{state | device: result.device}
+
+        Whatsmeow.Notifications.broadcast(state.device_id, %Events.PairSuccess{
+          device_id: state.device_id,
+          jid: parse_jid_or_nil(result.jid),
+          business_name: result.business_name,
+          platform: result.platform
+        })
+
+        {:ok, state2} = do_send_node(state, result.ack_iq) |> ok_or_keep(state)
+        state2
+
+      {:error, reason} ->
+        req_id = Binary.Node.attr(iq, "id", "")
+        err_iq = Pair.build_pair_error_iq(req_id, pair_error_code(reason), pair_error_text(reason))
+        _ = do_send_node(state, err_iq)
+
+        Logger.error("[whatsmeow] pair-success rejected — sent <iq type=error> to server",
+          device_id: state.device_id,
+          reason: inspect(reason),
+          code: pair_error_code(reason)
+        )
+
+        Whatsmeow.Notifications.broadcast(state.device_id, %Events.PairError{
+          device_id: state.device_id,
+          reason: reason
+        })
+
+        state
+    end
+  end
+
+  # --- success → LoggedIn + keepalive --------------------------------------
+
+  defp on_success(state, node) do
+    case Login.parse_first_node(node) do
+      {:ok, %Login.Result{lid: lid, server_time_offset: dt}} ->
+        :telemetry.execute(
+          [:whatsmeow, :session, :logged_in],
+          %{system_time: System.system_time()},
+          %{device_id: state.device_id, lid: lid}
+        )
+
+        Whatsmeow.Notifications.broadcast(state.device_id, %Events.LoggedIn{
+          device_id: state.device_id,
+          lid: lid,
+          server_time_offset: dt
+        })
+
+        # Schedule post-login bootstrap (active IQ + PreKey top-up).
+        # Done off-stack so the GenServer's <success> handling stays
+        # cheap; bootstrap is allowed to take a few seconds.
+        Process.send_after(self(), :post_login_bootstrap, 0)
+
+        state
+        |> Map.put(:status, :authenticated)
+        |> Map.put(:keepalive_failures, 0)
+        |> schedule_keepalive()
+
+      {:error, reason} ->
+        # parse_first_node was given a <success> node — shouldn't error,
+        # but if it does, treat as a stream-level failure.
+        Logger.warning("[whatsmeow] parse_first_node rejected <success>",
+          device_id: state.device_id,
+          reason: inspect(reason)
+        )
+
+        handle_disconnect(state, {:bad_success, reason})
+    end
+  end
+
+  defp on_failure(state, node) do
+    code = Binary.Node.attr(node, "code")
+    reason = Binary.Node.attr(node, "reason")
+
+    Logger.warning(
+      "[whatsmeow] <failure> code=#{inspect(code)} reason=#{inspect(reason)} attrs=#{inspect(node.attrs)}",
+      device_id: state.device_id
+    )
+
+    Whatsmeow.Notifications.broadcast(state.device_id, %Events.LoggedOut{
+      device_id: state.device_id,
+      on_connect: state.status in [:connecting, :handshaking, :connected],
+      reason: failure_reason_atom(reason)
+    })
+
+    # <failure> is terminal — clear auto_reconnect so we don't loop into a
+    # ban condition.
+    %{state | auto_reconnect?: false, status: :stopping}
+  end
+
+  defp on_stream_error(state, node) do
+    code = Binary.Node.attr(node, "code")
+    child_tags = stream_error_child_tags(node)
+
+    # Put the diagnostic detail in the message body, not just metadata —
+    # the default Logger formatter strips `:metadata` for everything
+    # except `:request_id`, so the old log line was empty of clues.
+    # Codes worth knowing about:
+    #   401  unauthorized   — bad payload, identity rejected
+    #   403  forbidden      — account flagged / banned
+    #   500  client-outdated — WAVersion drifted, refresh
+    #   503  rate-limited   — back off harder
+    #   515  stream replace — another session for this device just opened
+    Logger.warning(
+      "[whatsmeow] <stream:error> code=#{inspect(code)} attrs=#{inspect(node.attrs)} children=#{inspect(child_tags)}",
+      device_id: state.device_id
+    )
+
+    :telemetry.execute(
+      [:whatsmeow, :session, :stream_error],
+      %{system_time: System.system_time()},
+      %{device_id: state.device_id, code: code, child_tags: child_tags}
+    )
+
+    # Auto-recovery: code 500 = client-outdated, which means our pinned
+    # `client_revision` has drifted past the server's tolerance window.
+    # Kick a synchronous WAVersion refresh in a Task so the next
+    # reconnect's ClientPayload picks up the live revision. Without this
+    # the session loops forever inside the reconnect backoff while
+    # WAVersion.Refresher waits for its next hourly tick.
+    if code == "500", do: trigger_wa_version_refresh_async(state.device_id)
+
+    state
+  end
+
+  defp trigger_wa_version_refresh_async(device_id) do
+    Task.Supervisor.start_child(Whatsmeow.Media.TaskSup, fn ->
+      Logger.warning(
+        "[whatsmeow] <stream:error code=500> — forcing WAVersion.refresh/1 (client-outdated auto-recovery)",
+        device_id: device_id
+      )
+
+      case Whatsmeow.WAVersion.refresh(timeout: 30_000) do
+        {:ok, version} ->
+          Logger.warning(
+            "[whatsmeow] WAVersion refreshed to #{inspect(version)} after stream:error 500",
+            device_id: device_id
+          )
+
+        {:error, reason} ->
+          Logger.warning(
+            "[whatsmeow] WAVersion refresh FAILED (#{inspect(reason)}); next reconnect will retry the stale pin",
+            device_id: device_id
+          )
+      end
+    end)
+  end
+
+  defp stream_error_child_tags(%Binary.Node{content: children}) when is_list(children) do
+    Enum.map(children, fn
+      %Binary.Node{tag: t} -> t
+      _ -> :non_node
+    end)
+  end
+
+  defp stream_error_child_tags(_), do: []
+
+  defp on_iq_response(state, iq) do
+    req_id = Binary.Node.attr(iq, "id", "")
+    iq_type = Binary.Node.attr(iq, "type")
+
+    case Map.pop(state.pending, req_id) do
+      {:keepalive, pending} ->
+        # Server acked our ping. Reset the failure counter.
+        %{state | pending: pending, keepalive_failures: 0}
+
+      {{caller_pid, ref}, pending} when is_pid(caller_pid) ->
+        Logger.debug(
+          "[whatsmeow] iq response routed id=#{req_id} type=#{iq_type} pending=#{map_size(pending)}",
+          device_id: state.device_id
+        )
+
+        send(caller_pid, {:whatsmeow_iq, ref, iq})
+        %{state | pending: pending}
+
+      {nil, _} ->
+        Logger.debug(
+          "[whatsmeow] iq response with no matching pending id=#{req_id} type=#{iq_type}",
+          device_id: state.device_id
+        )
+
+        state
+    end
+  end
+
+  # Reply to a server-initiated `<iq type="get">` (typically a ping).
+  # Mirrors `cli.smoke` and upstream Go's request.go behavior: bare
+  # `<iq type="result" id=<same> to=<from>/>`. Skips the reply when the
+  # id is missing (empty-id replies trigger `<stream:error>`).
+  defp on_server_iq_get(state, iq) do
+    case Binary.Node.attr(iq, "id") do
+      id when is_binary(id) and id != "" ->
+        # `from` from a decoded iq is already a `%JID{}` (the decoder
+        # parses jid-shaped attrs). Use that directly so the reply's
+        # `to` attr serialises with the `@jid_pair` opcode. Fall back
+        # to a typed JID literal — never a plain string — to keep the
+        # encoding consistent with what Go produces.
+        from =
+          case Binary.Node.attr(iq, "from") do
+            %Whatsmeow.Types.JID{} = jid ->
+              jid
+
+            _ ->
+              %Whatsmeow.Types.JID{user: "", server: Whatsmeow.Types.JID.default_user_server()}
+          end
+
+        reply =
+          Binary.Node.new(
+            "iq",
+            %{"to" => from, "type" => "result", "id" => id},
+            nil
+          )
+
+        case do_send_node(state, reply) do
+          {:ok, state2} ->
+            state2
+
+          {:error, reason} ->
+            Logger.warning("[whatsmeow] failed to reply to server <iq type=get>",
+              device_id: state.device_id,
+              reason: inspect(reason)
+            )
+
+            state
+        end
+
+      _ ->
+        Logger.debug("[whatsmeow] <iq type=get> with no id — skipping reply",
+          device_id: state.device_id,
+          attrs: inspect(iq.attrs)
+        )
+
+        state
+    end
+  end
+
+  # Walk an `<ib>` info-broadcast and dispatch typed events for the
+  # children we recognise. Upstream Go (`connectionevents.go::handleIB`)
+  # silently ignores unknown children — we do the same. For now we
+  # only log; a future patch can broadcast `%Events.OfflineSyncPreview{}`
+  # etc. when the host needs them. Protocol-level: no ack required.
+  defp on_ib(state, %Binary.Node{} = node) do
+    children =
+      case node.content do
+        list when is_list(list) -> Enum.map(list, &(&1.tag || :non_node))
+        _ -> []
+      end
+
+    Logger.debug("[whatsmeow] <ib> received",
+      device_id: state.device_id,
+      from: Binary.Node.attr(node, "from"),
+      children: inspect(children)
+    )
+
+    state
+  end
+
+  # Log helper for unknown server iqs. Promoted from debug → info
+  # because "unhandled <iq>" is rare and worth seeing once during
+  # bring-up; if it becomes noisy in production we can demote and
+  # add a real handler for whatever child tag is appearing.
+  defp log_unhandled_iq(state, %Binary.Node{} = iq) do
+    children =
+      case iq.content do
+        list when is_list(list) ->
+          Enum.map(list, fn
+            %Binary.Node{tag: t} -> t
+            _ -> :non_node
+          end)
+
+        _ ->
+          []
+      end
+
+    Logger.info("[whatsmeow] unhandled <iq> — silently ignored (Go does the same)",
+      device_id: state.device_id,
+      attrs: inspect(iq.attrs),
+      children: inspect(children)
+    )
+
+    :ok
+  end
+
+  # --- keepalive helpers ---------------------------------------------------
+
+  defp schedule_keepalive(%__MODULE__{keepalive_timer: prior} = state) do
+    if is_reference(prior), do: Process.cancel_timer(prior)
+    jitter = :rand.uniform(2 * @keepalive_jitter_ms + 1) - @keepalive_jitter_ms - 1
+    ms = max(1_000, @keepalive_base_ms + jitter)
+    ref = Process.send_after(self(), :keepalive_tick, ms)
+    %{state | keepalive_timer: ref}
+  end
+
+  defp send_keepalive(state) do
+    id = IQ.generate_id()
+    iq = IQ.build_keepalive(id)
+
+    case do_send_node(state, iq) do
+      {:ok, state2} -> {:ok, %{state2 | pending: Map.put(state2.pending, id, :keepalive)}}
+      err -> err
+    end
+  end
+
+  defp bump_keepalive_failure(state) do
+    failures = state.keepalive_failures + 1
+
+    if failures >= @keepalive_max_consecutive_failures do
+      Logger.warning("[whatsmeow] keepalive failed #{failures} times — forcing reconnect",
+        device_id: state.device_id
+      )
+
+      handle_disconnect(state, :keepalive_failed)
+    else
+      %{state | keepalive_failures: failures}
+    end
+  end
+
+  # --- disconnect + reconnect ---------------------------------------------
+
+  defp handle_disconnect(state, reason) do
+    if is_reference(state.keepalive_timer), do: Process.cancel_timer(state.keepalive_timer)
+
+    # `state.transport` is a module atom — guard the close call with
+    # `function_exported?/3`. The old form `is_function(state.transport.close, 1)`
+    # parses as `(state.transport).close()` on Elixir 1.19 (a remote
+    # call with no parens, now disallowed) and crashes the GenServer
+    # with `UndefinedFunctionError` every time a disconnect fires —
+    # which means QR pairing loops forever (fresh session on every
+    # crash → new QR → stale scan).
+    if function_exported?(state.transport, :close, 1) and not is_nil(state.transport_conn) do
+      _ = state.transport.close(state.transport_conn)
+    end
+
+    Whatsmeow.Notifications.broadcast(state.device_id, %Events.Disconnected{
+      device_id: state.device_id,
+      reason: reason
+    })
+
+    state =
+      state
+      |> cancel_qr_emit_timer()
+      |> Map.merge(%{
+        transport_conn: nil,
+        noise_socket: nil,
+        noise_handshake: nil,
+        status: :disconnected,
+        keepalive_timer: nil,
+        qr_emit_queue: nil
+      })
+
+    if state.auto_reconnect?, do: schedule_reconnect(state), else: state
+  end
+
+  defp schedule_reconnect(state) do
+    attempt = state.reconnect_attempts + 1
+    delay = backoff_ms(attempt)
+
+    Logger.info("[whatsmeow] scheduling reconnect",
+      device_id: state.device_id,
+      attempt: attempt,
+      delay_ms: delay
+    )
+
+    if is_reference(state.reconnect_timer), do: Process.cancel_timer(state.reconnect_timer)
+    ref = Process.send_after(self(), {:reconnect, attempt}, delay)
+
+    %{state | reconnect_attempts: attempt, reconnect_timer: ref}
+  end
+
+  defp backoff_ms(attempt) when attempt > 0 do
+    base = min(@reconnect_max_ms, @reconnect_initial_ms * trunc(:math.pow(2, attempt - 1)))
+    jitter = :rand.uniform(500)
+    base + jitter
+  end
+
+  # Max random delay before the *first* connect attempt for a freshly-started
+  # session. Spreads a fleet cold-start over `[1, max]` ms so 50k boots don't
+  # thunder Meta's edge in one window. 0 (default) preserves immediate connect
+  # — required by the existing test suite. Set to e.g. 30_000 in production.
+  defp cold_start_jitter_ms do
+    Application.get_env(:whatsmeow_ex, :cold_start_jitter_ms, 0)
+  end
+
+  # --- wire helpers --------------------------------------------------------
+
+  defp do_send_node(%__MODULE__{noise_socket: nil}, _node), do: {:error, :not_connected}
+
+  defp do_send_node(state, %Binary.Node{} = node) do
+    plain = Binary.encode(node)
+    {ct, ns2} = NoiseSocket.encrypt(state.noise_socket, plain)
+    framed = Frame.wrap(ct)
+
+    case state.transport.send_binary(state.transport_conn, framed) do
+      {:ok, conn2} -> {:ok, %{state | noise_socket: ns2, transport_conn: conn2}}
+      {:error, _} = err -> err
+    end
+  end
+
+  defp ok_or_keep({:ok, state2}, _orig), do: {:ok, state2}
+  defp ok_or_keep({:error, _}, orig), do: {:ok, orig}
+
+  # Send a node and log any transport error — used by bootstrap helpers
+  # where we don't want a single failure to crash the GenServer.
+  defp send_node_or_log(state, %Binary.Node{} = node, label) do
+    case do_send_node(state, node) do
+      {:ok, state2} ->
+        state2
+
+      {:error, reason} ->
+        Logger.warning("[whatsmeow] post-login send failed",
+          device_id: state.device_id,
+          node: label,
+          reason: inspect(reason)
+        )
+
+        state
+    end
+  end
+
+  defp push_name(%Device{push_name: name}) when is_binary(name) and name != "", do: name
+  defp push_name(_), do: "whatsmeow_ex"
+
+  # First-upload detection: if we have no rows in `whatsmeow_pre_keys`
+  # for our_jid, treat this as a fresh device and upload the big
+  # initial batch (812 keys). Otherwise it's a top-up.
+  defp needs_initial_prekey_upload?(%Device{jid: jid}) when is_binary(jid) do
+    if Code.ensure_loaded?(Whatsmeow.Repo) and is_pid(Process.whereis(Whatsmeow.Repo)) do
+      import Ecto.Query
+
+      count =
+        from(p in Whatsmeow.Store.Schemas.PreKey, where: p.jid == ^jid, select: count(p.key_id))
+        |> Whatsmeow.Repo.one()
+
+      count in [nil, 0]
+    else
+      false
+    end
+  rescue
+    _ -> false
+  end
+
+  defp needs_initial_prekey_upload?(_), do: false
+
+  defp do_post_login_prekey_upload(server, initial?) do
+    case Whatsmeow.PreKeys.upload(server, initial?: initial?) do
+      {:ok, %{uploaded: n}} ->
+        Logger.info("[whatsmeow] post-login prekey upload OK", uploaded: n, initial?: initial?)
+
+      {:error, :no_repo} ->
+        Logger.debug("[whatsmeow] skipping prekey upload — Repo not started")
+
+      {:error, reason} ->
+        Logger.warning("[whatsmeow] post-login prekey upload failed", reason: inspect(reason))
+    end
+  rescue
+    e -> Logger.warning("[whatsmeow] prekey upload crashed", reason: Exception.message(e))
+  end
+
+  defp unpack_and_decode(plain) do
+    with {:ok, payload} <- unpack(plain) do
+      case Binary.decode(payload, strip_flag?: false) do
+        {:ok, node} -> {:ok, node}
+        {:error, reason} -> {:error, {:binary_decode, reason}}
+      end
+    end
+  end
+
+  defp unpack(<<flag, rest::binary>>) do
+    if Bitwise.band(flag, 2) > 0 do
+      try do
+        {:ok, :zlib.uncompress(rest)}
+      rescue
+        e -> {:error, {:zlib, Exception.message(e)}}
+      end
+    else
+      {:ok, rest}
+    end
+  end
+
+  defp unpack(<<>>), do: {:error, :empty_frame}
+
+  # --- store + helpers -----------------------------------------------------
+
+  defp maybe_persist_device(%Device{} = device) do
+    if Code.ensure_loaded?(Whatsmeow.Repo) and Process.whereis(Whatsmeow.Repo) do
+      do_persist_device(device)
+    else
+      :skipped
+    end
+  rescue
+    e ->
+      Logger.warning("[whatsmeow] device persist crashed", reason: Exception.message(e))
+      :error
+  end
+
+  # When pairing rewrites `device.jid` (e.g. "user-42" → "12345@s.whatsapp.net"),
+  # we want to UPDATE the existing row keyed by `client_id`, not insert a
+  # second one. The FK cascade (`on_update: :update_all`) then migrates all
+  # signal/prekey/session rows to the new jid. We fall back to a plain
+  # insert when no row matches the client_id yet (or when the device has
+  # no client_id at all — older test fixtures).
+  defp do_persist_device(%Device{client_id: cid} = device) when is_binary(cid) and cid != "" do
+    case Whatsmeow.Repo.get_by(Device, client_id: cid) do
+      nil ->
+        device
+        |> Device.changeset(Map.from_struct(device))
+        |> Whatsmeow.Repo.insert()
+        |> handle_persist_result()
+
+      %Device{} = existing ->
+        existing
+        |> Device.changeset(Map.from_struct(device))
+        |> Whatsmeow.Repo.update()
+        |> handle_persist_result()
+    end
+  end
+
+  defp do_persist_device(%Device{} = device) do
+    device
+    |> Device.changeset(Map.from_struct(device))
+    |> Whatsmeow.Repo.insert(on_conflict: :replace_all, conflict_target: [:jid])
+    |> handle_persist_result()
+  end
+
+  defp handle_persist_result({:ok, _}), do: :ok
+
+  defp handle_persist_result({:error, cs}) do
+    Logger.warning("[whatsmeow] device persist failed", errors: inspect(cs.errors))
+    :error
+  end
+
+  defp parse_jid_or_nil(nil), do: nil
+
+  defp parse_jid_or_nil(s) when is_binary(s) do
+    case Whatsmeow.Types.JID.parse(s) do
+      {:ok, jid} -> jid
+      _ -> nil
+    end
+  end
+
+  defp pair_error_code(:hmac_mismatch), do: 401
+  defp pair_error_code(:account_signature_invalid), do: 401
+  defp pair_error_code(:missing_account_signature), do: 401
+  defp pair_error_code(:missing_account_signature_key), do: 401
+  defp pair_error_code(_), do: 500
+
+  defp pair_error_text(:hmac_mismatch), do: "hmac-mismatch"
+  defp pair_error_text(:account_signature_invalid), do: "signature-mismatch"
+  defp pair_error_text(:missing_account_signature), do: "signature-mismatch"
+  defp pair_error_text(:missing_account_signature_key), do: "signature-mismatch"
+  defp pair_error_text(_), do: "internal-error"
+
+  defp failure_reason_atom("401"), do: :unauthorized
+  defp failure_reason_atom("403"), do: :forbidden
+  defp failure_reason_atom("405"), do: :not_allowed
+  defp failure_reason_atom("503"), do: :service_unavailable
+  defp failure_reason_atom(other) when is_binary(other), do: :failure
+  defp failure_reason_atom(_), do: :failure
+
+  defp via(device_id), do: {:via, Registry, {Whatsmeow.Sessions.Registry, device_id}}
+
+  defp via_or_pid(pid) when is_pid(pid), do: pid
+  defp via_or_pid(device_id) when is_binary(device_id), do: via(device_id)
+
+  # --- test seams ----------------------------------------------------------
+
+  @doc false
+  # Exposes the private dispatch tree for unit tests so we can lock the
+  # routing logic without standing up a full mock transport. Production
+  # callers go through `handle_info/2`.
+  def __dispatch_node__(state, %Binary.Node{} = node), do: dispatch_node(state, node)
+
+  @doc false
+  def __failure_reason_atom__(reason), do: failure_reason_atom(reason)
+
+  @doc false
+  def __backoff_ms__(attempt), do: backoff_ms(attempt)
+
+  @doc false
+  def __pair_error__(reason), do: {pair_error_code(reason), pair_error_text(reason)}
+end
