@@ -9,7 +9,7 @@ defmodule Whatsmeow.Signal.WireDecryptTest do
   # Build a SignalMessage envelope the way an initiator would after
   # X3DH + first ratchet step: encrypt with the new sending chain's
   # message key, MAC with libsignal's formula.
-  defp build_initiator_envelope(plaintext, sess, sender_id_pub, receiver_id_pub) do
+  defp build_initiator_envelope(plaintext, %Session{} = sess, sender_id_pub, receiver_id_pub) do
     {next_ck, mk} = Ratchet.kdf_ck(sess.sending_ck)
     {enc_key, mac_key, iv} = Ratchet.derive_message_keys(mk)
 

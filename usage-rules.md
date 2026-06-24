@@ -47,6 +47,28 @@ The receiving side is **event-driven**: subscribe with `Whatsmeow.subscribe/1` a
 
 ---
 
+## 2.5 Performance — what the library does for you (and what it expects you to *not* do)
+
+The 2026-05-19 perf pass made these guarantees. The rules in §3/§4 below pre-date that pass; this section is the **specific** advice for using the new behavior.
+
+* **Fanout is already parallel.** `Whatsmeow.Send.send_text/3`, `send_image/4` (and friends), `Whatsmeow.Send.Group.send_text/4`, and `Whatsmeow.Send.send_peer_message/2` all use `Task.async_stream` with `:send_concurrency` (default 8). **You don't need to wrap calls in your own `Task.async`** — that adds pool pressure without throughput.
+* **Broadcasts are synchronous AND ordered.** Inbound `%Events.Message{}`, `%Events.MediaMessage{}`, `%Events.Receipt{}`, `%Events.UndecryptableMessage{}` are emitted from the session GenServer's pid via `Phoenix.PubSub.broadcast/3`. Same-session messages arrive at a subscriber in **wire order** because Erlang's `send/2` is FIFO from a single sender. This matters for agent frameworks (Jido, etc.) that update state per-message — your `handle_info/2` clauses see events in the order WhatsApp sent them.
+  * `Notifications.broadcast_async/2` exists but **does NOT preserve order** (verified — see `bench/recv_path.exs`). Don't call it on the inbound path.
+* **Media downloads share an HKDF cache.** `Whatsmeow.Media.HKDFCache` is supervised; entries time out 5 min after their last use. Multiple downloads of the same `media_key` reuse the 112-byte expansion. **DO NOT** add a competing cache layer — `:erlang.binary_to_term` on a session blob is the only repeated heavy crypto path left, and it is intentionally not cached cross-message.
+* **Initial pairing's 812 prekeys ship in one transaction.** `Whatsmeow.PreKeys.upload/2` (called by the post-login bootstrap) batches `Repo.insert_all` in chunks of 200. **DO NOT** wrap it in your own transaction — the chunking is designed to stay under Postgres's parameter limit by itself.
+* **Tune fanout when you genuinely need it.** Default `:send_concurrency` is 8 — conservative for small VMs. If your typical group is >100 participants AND the box is multi-core, set to `System.schedulers_online()`:
+
+  ```elixir
+  config :whatsmeow_ex,
+    send_concurrency: System.schedulers_online(),
+    fanout_task_timeout_ms: 60_000
+  ```
+* **Run the perf-indexes migration on upgrade.** `priv/repo/migrations/20260519000001_perf_indexes.exs`. Without it, app-state patch apply and contact reverse-lookups full-scan.
+* **The retry-count ETS table self-sweeps.** Hourly sweep drops rows older than 24 h. Logs at `:debug` only when there's anything to drop. Don't touch `:whatsmeow_message_retries` from the host app — it's a private cache.
+* **`skipped_keys` on group sessions is capped at 500.** The 2000-iteration jump tolerance still applies, but only the most-recent 500 keys are retained. Don't assume an out-of-order message older than ~500 iterations will still decrypt.
+
+---
+
 ## 3. DOs
 
 * **DO subscribe per-device.** `Whatsmeow.subscribe(device_id)` parks you on the per-device PubSub topic. Match `{:whatsmeow, %Events.Message{} = msg}` etc. in `handle_info/2`.
@@ -226,7 +248,16 @@ One subscriber inflates your mailbox by `fleet_size × event_rate`. At 50k sessi
 Enum.each(peers, fn p -> Whatsmeow.Send.send_text(session, p, "hi") end)
 ```
 
-Each `send_text` does X3DH lookup, ratchet step, Postgres write, IQ correlation. Serialised in one process this is slow AND it tells Meta you're a bot. Use a token-bucketed gate.
+Each `send_text` does X3DH lookup, ratchet step, Postgres write, IQ correlation. **The per-device fanout INSIDE one `send_text/3` is already parallelised** (`Task.async_stream` with `:send_concurrency`); what is NOT parallelised — and never should be — is sending to **different peers** from a hot loop. That looks bot-like to Meta no matter how fast it is. Use a token-bucketed gate (§6.5) and let it pace you.
+
+### Anti-pattern D2: wrapping `send_text` in your own Task
+
+```elixir
+# DON'T:
+Enum.each(devices, fn d -> Task.async(fn -> Whatsmeow.Send.send_text(session, d, "hi") end) end)
+```
+
+The library already runs the per-device-encrypt fanout under `Task.async_stream` internally. Adding an outer `Task.async` per device just shifts work to a different pool — the session's GenServer is still the single writer for the WSS, and you've now spawned 2× as many processes for no win. Trust the library's concurrency; tune `:send_concurrency` instead.
 
 ### Anti-pattern E: trusting `:ets` for durable state
 
@@ -257,6 +288,9 @@ The persona is the device's fingerprint to Meta. Changing it across reconnects l
 5. **Redact proxy userinfo before logging.** `Whatsmeow.Transport.WebSocket.Mint.parse_proxy/1` already does this for you — don't unwrap and log.
 6. **Persona is stable per Device.** Set at pair; never change.
 7. **Cold-start jitter required at fleet scale.** Production config must include `:cold_start_jitter_ms`.
+8. **Hot-path broadcasts stay synchronous from the session pid.** Per-subscriber FIFO ordering relies on this — don't wrap broadcasts in `Task.async`/`Task.Supervisor` or call `broadcast_async/2` on inbound events. Benchmark on this codebase showed broadcast is ~1 µs/sub and `send/2` is non-blocking, so the cost was never the issue people expected.
+9. **Per-fanout work goes through `Task.async_stream`, not `Enum.each`.** The library follows this for DM-multi-device, group SKDM, peer-message, and prekey-gen. Any new per-recipient pipeline you add inside the library MUST use the same pattern with `Whatsmeow.Config.send_concurrency/0`.
+10. **Use `Repo.insert_all` for bulk writes >50 rows.** Per-row `Repo.insert/2` was the cause of the 800 ms initial-pairing stall; the rule applies to any future bulk path too. Chunk at ≤200 rows × ≤4 cols to stay under the 65 535-parameter Postgres limit.
 
 ---
 
@@ -287,4 +321,4 @@ Attach these telemetry events in your boot code:
 * **What's a real production smoke?** `mix whatsmeow.smoke --load-jid <JID> --persist --relogin` — pairs OR reuses a paired device, reconnects with `login_payload`, holds the WSS, decrypts every inbound message. The fastest "is it working" check.
 * **Is this safe at 50k accounts?** Run `N=1000 mix run bench/session_memory.exs` first. If the per-session memory has drifted from ~2.7 KB, something has been added to the Session struct — investigate before scaling.
 
-If the rule above conflicts with the current code, the code wins — file an issue or update this document. These rules are a contract for the shape of the library as of `2026-05-12 / 537 tests`.
+If the rule above conflicts with the current code, the code wins — file an issue or update this document. These rules are a contract for the shape of the library as of `2026-05-19 / 542 tests / post perf pass`.

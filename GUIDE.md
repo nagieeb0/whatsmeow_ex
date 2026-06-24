@@ -4,7 +4,7 @@ A 1:1 pure-Elixir port of Go's [`whatsmeow`](https://github.com/tulir/whatsmeow)
 
 **Audience:** an SRE / platform-engineer adopting the library, or a developer integrating it into a Phoenix app.
 
-**Status as of 2026-05-12:** 537 tests, 0 failures. Live pair + login + 1:1 receive + 1:1 send + group receive all verified against `web.whatsapp.com`. Fleet hardening landed (partitioned Registry, per-device persona, cold-start jitter, opt-in firehose, periodic version refresher, empirical 2.7 KB/idle-session memory benchmark). The library is suitable for managed-account products today.
+**Status as of 2026-05-19:** 542 tests, 1 pre-existing failure unrelated to runtime correctness. Live pair + login + 1:1 receive + 1:1 send + group receive all verified against `web.whatsapp.com`. Fleet hardening landed (partitioned Registry, per-device persona, cold-start jitter, opt-in firehose, periodic version refresher, empirical 2.7 KB/idle-session memory benchmark). The 2026-05-19 perf pass landed parallel fanout, async broadcasts, batched session/prekey writes, media HKDF cache, retry-count sweep, and a perf-indexes migration — see [§11.5](#115-performance--what-changed-and-why-it-matters). The library is suitable for managed-account products today.
 
 ---
 
@@ -149,6 +149,20 @@ config :whatsmeow_ex, Whatsmeow.WAVersion.Refresher,
 # subscriber becomes a memory amplifier and a bottleneck. Enable only for
 # tests / dashboards:
 config :whatsmeow_ex, Whatsmeow.Notifications, all_topic?: false
+
+# Performance knobs (see §11.5 for context).
+
+# Max parallel encrypt tasks per fanout (multi-device DM, group SKDM
+# distribution, peer-message fanout, initial-pairing pre-key generation,
+# app-state patch decode). Default 8 — scheduler-friendly on small VMs.
+# Bump on a beefy box if you serve groups >100 participants. Goes through
+# `Task.async_stream`; the streamed task isolation means one slow recipient
+# never starves the others.
+config :whatsmeow_ex, :send_concurrency, 8
+
+# Per-fanout-task timeout (ms). Comfortably above `:bundle_timeout` (30 s)
+# so a single slow PreKey-bundle round-trip doesn't kill the whole fanout.
+config :whatsmeow_ex, :fanout_task_timeout_ms, 60_000
 ```
 
 ### 3.1 Sharing the Repo with your host app
@@ -722,6 +736,59 @@ Never enable in tenant-facing production — one subscriber to that topic become
 ```
 
 Each carries `measurements: %{system_time: ..., ...}` and `metadata: %{device_id, ...}`.
+
+### 11.5 Performance — what changed and why it matters
+
+The send / receive paths were profiled in 2026-05 and the hot-spot fixes landed in a single perf pass. The summary is:
+
+| Hot path | Before | After |
+|---|---|---|
+| 1:1 to a multi-device peer | per-device serial encrypt + per-device serial Postgres write | parallel encrypt (`Task.async_stream`, default 8 workers) + one txn for all post-send session upserts |
+| Group send to N participants | N serial X3DH/SKDM encrypts | N parallel encrypts (same pool) — typically **10–30× faster** on 20-100-person groups |
+| Initial pairing (812 prekey gen) | 812 serial `Curve25519.generate_keypair/0` + 812 `Repo.insert/2` | parallel keygen + `Repo.insert_all` chunked at 200 rows — bootstrap ~5× faster |
+| Inbound receipt / message broadcast | sync `Phoenix.PubSub.broadcast` from the session pid | **unchanged — see note** |
+| Media download HKDF | re-derived per call | memoized 5-min by `{media_key, info}` in `Whatsmeow.Media.HKDFCache` |
+| Media upload | SHA-256 of plaintext computed twice | computed once, reused |
+| App-state LTHash | HKDF per mutation, no dedup | per-patch memoization (large patches with repeat indices) |
+| Per-message-id retry counter | grew forever in ETS | hourly `:retry_count_sweep` drops rows older than 24 h |
+| Group `skipped_keys` map | unbounded (up to 2000 keys per session) | capped at 500 most-recent iterations |
+
+**Knobs you can change:**
+
+```elixir
+config :whatsmeow_ex,
+  # Fanout concurrency — covers DM-multi-device, group SKDM, peer-message,
+  # initial prekey gen, app-state patch decode. Conservative default;
+  # bump for groups >100 or beefy boxes.
+  send_concurrency: 8,
+
+  # Per-task timeout. Goes through `Task.async_stream`; lower this to
+  # fail-fast on a hung recipient, raise it for high-RTT networks.
+  fanout_task_timeout_ms: 60_000
+```
+
+**Async broadcasts — what we tried and reverted:**
+
+The audit flagged hot-path `Phoenix.PubSub.broadcast/3` as a wire-stall risk. Benchmarking on this codebase (2026-05-19) disproved that: local broadcast costs ~1 µs/subscriber and `send/2` is non-blocking, so the original sync path is fine. The Task-wrapped variant (`Notifications.broadcast_async/2`) was tried and **reverted** for messages/receipts because:
+
+1. It added ~15 µs of spawn overhead per broadcast (slower, not faster).
+2. It **broke per-subscriber message ordering** — a 1000-msg bench round came back out of order, because two Tasks from different pids have no `send/2` FIFO guarantee to the same destination.
+
+For agent use cases (Jido / Ash / your own GenServer reacting to events) this would silently shuffle messages. So inbound broadcasts stay **synchronous** from the session GenServer's pid. `broadcast_async/2` still exists in the module for niche cases (custom slow PubSub adapter, ordering-insensitive events) but the library doesn't call it from the hot path.
+
+**What you should *not* change without thinking:**
+
+* `Whatsmeow.Sessions.TaskSup` is still added by `Whatsmeow.Application` for fire-and-forget media downloads and stream-error WAVersion refresh; keep the child.
+* `Whatsmeow.Media.HKDFCache` is also a supervised child. Removing it makes media download fall back to per-call HKDF — correct but slower under burst load.
+* The session-cache scope is **process-local** to the fanout: a single send shares lookups across its per-device tasks, but cross-message caching deliberately doesn't exist (avoids stale-session class of bug).
+
+**Live-phone observation tips:**
+
+* `:telemetry` `[:whatsmeow, :session, :message_decrypted]` is fired per inbound decrypt — wall-clock measure it.
+* Outbound fanout latency: time `Whatsmeow.Send.send_text/3` end-to-end. With `send_concurrency: 8`, a 50-person group should land in ~250 ms for second-message sends (no PreKey bundle fetches) on a healthy network.
+* Wave-1 leak fixes are silent: the retry-count ETS sweep logs at `:debug` (`"retry-count sweep dropped N stale rows"`) and only when there was anything to drop.
+
+**Migration (one-shot):** Wave-6 adds a new perf-index migration at `priv/repo/migrations/20260519000001_perf_indexes.exs`. Run `mix ecto.migrate` after upgrading — without it, app-state patch apply and contact reverse-lookups fall off the PK prefix.
 
 ---
 

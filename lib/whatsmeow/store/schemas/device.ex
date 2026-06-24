@@ -17,18 +17,21 @@ defmodule Whatsmeow.Store.Schemas.Device do
 
     field(:registration_id, :integer)
 
-    field(:noise_key, :binary)
-    field(:identity_key, :binary)
+    # Secret key material — encrypted at rest via Whatsmeow.Vault (transparent;
+    # passthrough when no vault key is configured). These columns ARE the live
+    # account identity, so they must never sit in Postgres as plaintext.
+    field(:noise_key, Whatsmeow.Vault.Binary)
+    field(:identity_key, Whatsmeow.Vault.Binary)
 
-    field(:signed_pre_key, :binary)
+    field(:signed_pre_key, Whatsmeow.Vault.Binary)
     field(:signed_pre_key_id, :integer)
-    field(:signed_pre_key_sig, :binary)
+    field(:signed_pre_key_sig, Whatsmeow.Vault.Binary)
 
-    field(:adv_key, :binary)
-    field(:adv_details, :binary)
-    field(:adv_account_sig, :binary)
-    field(:adv_account_sig_key, :binary)
-    field(:adv_device_sig, :binary)
+    field(:adv_key, Whatsmeow.Vault.Binary)
+    field(:adv_details, Whatsmeow.Vault.Binary)
+    field(:adv_account_sig, Whatsmeow.Vault.Binary)
+    field(:adv_account_sig_key, Whatsmeow.Vault.Binary)
+    field(:adv_device_sig, Whatsmeow.Vault.Binary)
 
     field(:platform, :string, default: "")
     field(:business_name, :string, default: "")

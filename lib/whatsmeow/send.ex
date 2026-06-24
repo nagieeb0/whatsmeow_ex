@@ -106,7 +106,8 @@ defmodule Whatsmeow.Send do
          {:ok, %Device{} = device} <- Session.get_device(server),
          {:ok, our_ad_jid} <- parse_device_jid(device.jid),
          :ok <- guard_not_self(our_ad_jid, peer_jid) do
-      do_send_text(server, device, our_ad_jid, peer_jid, text, opts)
+      inner_proto = %WAWebProtobufsE2E.Message{conversation: text}
+      do_send_dm(server, device, our_ad_jid, peer_jid, inner_proto, "text", opts)
     end
   end
 
@@ -120,10 +121,22 @@ defmodule Whatsmeow.Send do
   # but silently drops delivery — the recipient phone never buzzes.
   # Mirrors Go's `sendDM` + `prepareMessageNode` + `encryptMessageForDevices`
   # (`whatsmeow-main/send.go:841,1156,1261`).
-  defp do_send_text(server, %Device{} = device, %JID{} = our_ad_jid, %JID{} = peer_jid, text, opts) do
-    plaintext = build_e2e_text_message(text)
-
-    inner_proto = %WAWebProtobufsE2E.Message{conversation: text}
+  #
+  # `msg_type` is the outer `<message type="…">` attribute — `"text"` for
+  # plain text, `"media"` for image/video/audio/document. Same fanout shape
+  # in either case (Go's `sendDM` doesn't branch on payload kind).
+  defp do_send_dm(
+         server,
+         %Device{} = device,
+         %JID{} = our_ad_jid,
+         %JID{} = peer_jid,
+         %WAWebProtobufsE2E.Message{} = inner_proto,
+         msg_type,
+         opts
+       )
+       when msg_type in ["text", "media"] do
+    plaintext =
+      inner_proto |> WAWebProtobufsE2E.Message.encode() |> IO.iodata_to_binary()
 
     dsm_plaintext =
       %WAWebProtobufsE2E.Message{
@@ -144,26 +157,9 @@ defmodule Whatsmeow.Send do
       our_bare_user = our_ad_jid.user
 
       {participant_nodes, sessions_to_persist, any_pkmsg} =
-        Enum.reduce(devices, {[], [], false}, fn ad_jid, {nodes_acc, sessions_acc, pkmsg_acc} ->
+        parallel_fanout(devices, fn ad_jid ->
           pt = if ad_jid.user == our_bare_user, do: dsm_plaintext, else: plaintext
-
-          case encrypt_plaintext_for_peer(server, device, ad_jid, pt, opts) do
-            {:ok, envelope, enc_type, new_sess} ->
-              participant = build_participant_node(ad_jid, envelope, enc_type)
-
-              {
-                [participant | nodes_acc],
-                [{ad_jid, new_sess} | sessions_acc],
-                pkmsg_acc or enc_type == "pkmsg"
-              }
-
-            {:error, reason} ->
-              Logger.warning(
-                "[whatsmeow] dm fanout: skipped #{JID.to_string(ad_jid)}: #{inspect(reason)}"
-              )
-
-              {nodes_acc, sessions_acc, pkmsg_acc}
-          end
+          {ad_jid, encrypt_plaintext_for_peer(server, device, ad_jid, pt, opts)}
         end)
 
       case Enum.reverse(participant_nodes) do
@@ -177,23 +173,22 @@ defmodule Whatsmeow.Send do
             Keyword.get_lazy(opts, :message_id, fn -> generate_message_id(device.jid) end)
 
           msg_node =
-            build_dm_message_node(peer_jid, msg_id, participant_nodes, device, any_pkmsg)
+            build_dm_message_node(peer_jid, msg_id, participant_nodes, device, any_pkmsg, msg_type)
 
           case Session.send_node(server, msg_node) do
             :ok ->
               # Persist each advanced Signal session AFTER the wire send
               # succeeds — same reason as before (if the WSS write fails
-              # we don't want to burn the chain keys).
-              for {ad_jid, new_sess} <- sessions_to_persist do
-                _ = Decrypt.persist_session(device.jid, JID.to_string(ad_jid), new_sess)
-              end
+              # we don't want to burn the chain keys). Now batched in a
+              # single transaction so we don't issue N serial round-trips.
+              _ = persist_sessions_batch(device.jid, sessions_to_persist)
 
               _ =
                 Whatsmeow.Retry.RecentCache.put(
                   JID.to_string(peer_jid),
                   msg_id,
                   plaintext,
-                  "text"
+                  msg_type
                 )
 
               {:ok, msg_id}
@@ -217,8 +212,10 @@ defmodule Whatsmeow.Send do
          msg_id,
          participant_nodes,
          %Device{} = device,
-         include_identity?
-       ) do
+         include_identity?,
+         msg_type
+       )
+       when msg_type in ["text", "media"] do
     # Mirror Go's `prepareMessageNode` (`whatsmeow-main/send.go:1185`)
     # exactly — id / type / to only. `phash` is server-side: it's the
     # value the server *returns* on the `<ack>`. Including `phash` as an
@@ -227,7 +224,7 @@ defmodule Whatsmeow.Send do
     # (smax-invalid) without delivering. Took an hour to spot.
     attrs = %{
       "id" => msg_id,
-      "type" => "text",
+      "type" => msg_type,
       "to" => JID.to_non_ad(peer_jid)
     }
 
@@ -574,18 +571,8 @@ defmodule Whatsmeow.Send do
            devices = strip_self_and_hosted(all_devices, our_ad_jid),
            :ok <- guard_have_devices(devices) do
         {participant_nodes, sessions_to_persist, any_pkmsg} =
-          Enum.reduce(devices, {[], [], false}, fn ad_jid, {nodes_acc, sessions_acc, pkmsg_acc} ->
-            case encrypt_plaintext_for_peer(server, device, ad_jid, plaintext, opts) do
-              {:ok, envelope, enc_type, new_sess} ->
-                {
-                  [build_participant_node(ad_jid, envelope, enc_type) | nodes_acc],
-                  [{ad_jid, new_sess} | sessions_acc],
-                  pkmsg_acc or enc_type == "pkmsg"
-                }
-
-              {:error, _reason} ->
-                {nodes_acc, sessions_acc, pkmsg_acc}
-            end
+          parallel_fanout(devices, fn ad_jid ->
+            {ad_jid, encrypt_plaintext_for_peer(server, device, ad_jid, plaintext, opts)}
           end)
 
         case Enum.reverse(participant_nodes) do
@@ -615,10 +602,7 @@ defmodule Whatsmeow.Send do
 
             case Session.send_node(server, node) do
               :ok ->
-                for {ad_jid, new_sess} <- Enum.reverse(sessions_to_persist) do
-                  _ = Decrypt.persist_session(device.jid, JID.to_string(ad_jid), new_sess)
-                end
-
+                _ = persist_sessions_batch(device.jid, sessions_to_persist)
                 {:ok, msg_id}
 
               {:error, reason} ->
@@ -787,23 +771,16 @@ defmodule Whatsmeow.Send do
   defp send_media(server, peer, bytes, kind, opts) do
     with {:ok, peer_jid} <- to_jid(peer),
          {:ok, %Device{} = device} <- Session.get_device(server),
-         {:ok, upload} <- upload_media_bytes(bytes, kind, opts),
-         {:ok, plaintext} <- {:ok, build_e2e_media_message(kind, upload, opts)},
-         {:ok, envelope, enc_type, new_sess} <-
-           encrypt_plaintext_for_peer(server, device, peer_jid, plaintext, opts) do
-      msg_id = Keyword.get_lazy(opts, :message_id, &generate_message_id/0)
-      node = build_media_message_node(peer_jid, msg_id, envelope, enc_type)
-
-      case Session.send_node(server, node) do
-        :ok ->
-          their_id = JID.to_string(peer_jid)
-          _ = Whatsmeow.Signal.Decrypt.persist_session(device.jid, their_id, new_sess)
-          _ = Whatsmeow.Retry.RecentCache.put(their_id, msg_id, plaintext, "media")
-          {:ok, msg_id}
-
-        {:error, reason} ->
-          {:error, {:transport, reason}}
-      end
+         {:ok, our_ad_jid} <- parse_device_jid(device.jid),
+         :ok <- guard_not_self(our_ad_jid, peer_jid),
+         {:ok, upload} <- upload_media_bytes(bytes, kind, opts) do
+      inner_proto = build_media_message_proto(kind, upload, opts)
+      # Outer `<message type=>` mirrors Go's `sendDM` — it uses "text" even
+      # for media-carrying DMs (the payload kind is implicit in the protobuf,
+      # not in the stanza-level type attr). Earlier `"media"` was a silent
+      # delivery killer: server accepts with `<ack class="message">` but
+      # recipient phone never renders the imageMessage.
+      do_send_dm(server, device, our_ad_jid, peer_jid, inner_proto, "text", opts)
     end
   end
 
@@ -824,8 +801,19 @@ defmodule Whatsmeow.Send do
     end
   end
 
-  defp build_e2e_media_message(:image, upload, opts) do
-    msg = %WAWebProtobufsE2E.Message{
+  # Build the unencoded `%WAWebProtobufsE2E.Message{}` carrying a media
+  # descriptor. Returns the struct (NOT the encoded bytes) so the caller
+  # can rewrap it inside a `DeviceSentMessage` for own-device fanout
+  # before encoding per-device plaintexts.
+  #
+  # For image/video, `:jpeg_thumbnail` (+ `:width`/`:height`) carry the inline
+  # preview WhatsApp shows before download. WITHOUT a thumbnail the recipient
+  # sees a grey placeholder until they manually tap-to-download — the full
+  # media (URL/mediaKey/sha) is correct, only the preview is missing. The
+  # caller is responsible for generating the thumbnail (e.g. via ImageMagick).
+  @doc false
+  def build_media_message_proto(:image, upload, opts) do
+    %WAWebProtobufsE2E.Message{
       imageMessage: %WAWebProtobufsE2E.ImageMessage{
         URL: upload.url,
         directPath: upload.direct_path,
@@ -835,15 +823,16 @@ defmodule Whatsmeow.Send do
         fileLength: upload.file_length,
         mimetype: Keyword.get(opts, :mime_type, "image/jpeg"),
         caption: Keyword.get(opts, :caption),
-        mediaKeyTimestamp: System.os_time(:second)
+        mediaKeyTimestamp: System.os_time(:second),
+        JPEGThumbnail: Keyword.get(opts, :jpeg_thumbnail),
+        height: Keyword.get(opts, :height),
+        width: Keyword.get(opts, :width)
       }
     }
-
-    msg |> WAWebProtobufsE2E.Message.encode() |> IO.iodata_to_binary()
   end
 
-  defp build_e2e_media_message(:video, upload, opts) do
-    msg = %WAWebProtobufsE2E.Message{
+  def build_media_message_proto(:video, upload, opts) do
+    %WAWebProtobufsE2E.Message{
       videoMessage: %WAWebProtobufsE2E.VideoMessage{
         URL: upload.url,
         directPath: upload.direct_path,
@@ -854,15 +843,16 @@ defmodule Whatsmeow.Send do
         mimetype: Keyword.get(opts, :mime_type, "video/mp4"),
         caption: Keyword.get(opts, :caption),
         seconds: Keyword.get(opts, :duration_seconds),
-        mediaKeyTimestamp: System.os_time(:second)
+        mediaKeyTimestamp: System.os_time(:second),
+        JPEGThumbnail: Keyword.get(opts, :jpeg_thumbnail),
+        height: Keyword.get(opts, :height),
+        width: Keyword.get(opts, :width)
       }
     }
-
-    msg |> WAWebProtobufsE2E.Message.encode() |> IO.iodata_to_binary()
   end
 
-  defp build_e2e_media_message(kind, upload, opts) when kind in [:audio, :voice] do
-    msg = %WAWebProtobufsE2E.Message{
+  def build_media_message_proto(kind, upload, opts) when kind in [:audio, :voice] do
+    %WAWebProtobufsE2E.Message{
       audioMessage: %WAWebProtobufsE2E.AudioMessage{
         URL: upload.url,
         directPath: upload.direct_path,
@@ -876,12 +866,10 @@ defmodule Whatsmeow.Send do
         mediaKeyTimestamp: System.os_time(:second)
       }
     }
-
-    msg |> WAWebProtobufsE2E.Message.encode() |> IO.iodata_to_binary()
   end
 
-  defp build_e2e_media_message(:document, upload, opts) do
-    msg = %WAWebProtobufsE2E.Message{
+  def build_media_message_proto(:document, upload, opts) do
+    %WAWebProtobufsE2E.Message{
       documentMessage: %WAWebProtobufsE2E.DocumentMessage{
         URL: upload.url,
         directPath: upload.direct_path,
@@ -895,19 +883,6 @@ defmodule Whatsmeow.Send do
         mediaKeyTimestamp: System.os_time(:second)
       }
     }
-
-    msg |> WAWebProtobufsE2E.Message.encode() |> IO.iodata_to_binary()
-  end
-
-  # Wrap the media plaintext in `<message type="media"><enc>` — same
-  # outer shape as text but the `type` attribute switches to `"media"`,
-  # mirroring Go's `sendDM` branch for non-text payloads.
-  defp build_media_message_node(%JID{} = to, message_id, envelope, enc_type) do
-    Node.new(
-      "message",
-      %{"id" => message_id, "type" => "media", "to" => to},
-      [Node.new("enc", %{"v" => "2", "type" => enc_type}, envelope)]
-    )
   end
 
   @doc """
@@ -989,6 +964,80 @@ defmodule Whatsmeow.Send do
               {:error, {:encrypt, reason}}
           end
         end
+    end
+  end
+
+  # --- Parallel fanout helpers --------------------------------------------
+  #
+  # Encrypt-per-device is independent work, but historically ran serially
+  # via Enum.reduce — a group of 50 participants meant 50 sequential
+  # X3DH / SKDM encryptions plus 50 PreKey-bundle IQ round-trips when no
+  # session existed. `parallel_fanout/2` runs the per-device encrypt
+  # closure under `Task.async_stream/3` with `Whatsmeow.Config.send_concurrency/0`
+  # workers (default 8 — see Config docs) and re-merges into the same
+  # `{participant_nodes, sessions_to_persist, any_pkmsg?}` accumulator
+  # the old reduce produced. Order of `participant_nodes` is irrelevant
+  # on the wire (the server doesn't depend on participant order inside
+  # `<participants>`), so we use `ordered: false`.
+
+  @doc false
+  @spec parallel_fanout(
+          [JID.t()],
+          (JID.t() ->
+             {JID.t(), {:ok, binary(), String.t(), term()} | {:error, term()}})
+        ) :: {[Node.t()], [{JID.t(), term()}], boolean()}
+  def parallel_fanout(devices, encrypt_fun) when is_list(devices) and is_function(encrypt_fun, 1) do
+    devices
+    |> Task.async_stream(encrypt_fun,
+      max_concurrency: Whatsmeow.Config.send_concurrency(),
+      ordered: false,
+      timeout: Whatsmeow.Config.fanout_task_timeout_ms(),
+      on_timeout: :kill_task
+    )
+    |> Enum.reduce({[], [], false}, &collect_fanout_result/2)
+  end
+
+  defp collect_fanout_result(
+         {:ok, {%JID{} = ad_jid, {:ok, envelope, enc_type, new_sess}}},
+         {nodes, sessions, pkmsg?}
+       )
+       when enc_type in ["msg", "pkmsg"] do
+    participant = build_participant_node(ad_jid, envelope, enc_type)
+    {[participant | nodes], [{ad_jid, new_sess} | sessions], pkmsg? or enc_type == "pkmsg"}
+  end
+
+  defp collect_fanout_result({:ok, {%JID{} = ad_jid, {:error, reason}}}, acc) do
+    Logger.warning("[whatsmeow] dm fanout: skipped #{JID.to_string(ad_jid)}: #{inspect(reason)}")
+
+    acc
+  end
+
+  defp collect_fanout_result({:exit, reason}, acc) do
+    Logger.warning("[whatsmeow] dm fanout: task crashed: #{inspect(reason)}")
+    acc
+  end
+
+  # Persist each advanced Signal session in a single transaction so the
+  # post-send DB cost is one round-trip rather than N. Falls back to
+  # serial put when no Repo is available.
+  @doc false
+  @spec persist_sessions_batch(String.t(), [{JID.t(), term()}]) :: :ok
+  def persist_sessions_batch(our_jid, sessions) when is_binary(our_jid) and is_list(sessions) do
+    if repo_up?() do
+      _ =
+        Whatsmeow.Repo.transaction(fn ->
+          for {%JID{} = ad_jid, new_sess} <- sessions do
+            _ = Decrypt.persist_session(our_jid, JID.to_string(ad_jid), new_sess)
+          end
+        end)
+
+      :ok
+    else
+      for {%JID{} = ad_jid, new_sess} <- sessions do
+        _ = Decrypt.persist_session(our_jid, JID.to_string(ad_jid), new_sess)
+      end
+
+      :ok
     end
   end
 end

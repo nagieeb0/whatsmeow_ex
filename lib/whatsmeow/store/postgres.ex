@@ -50,7 +50,11 @@ defmodule Whatsmeow.Store.Postgres do
       adv_details: Keyword.get(opts, :adv_details, <<>>),
       adv_account_sig: Keyword.get(opts, :adv_account_sig, :crypto.strong_rand_bytes(64)),
       adv_account_sig_key: Keyword.get(opts, :adv_account_sig_key, :crypto.strong_rand_bytes(32)),
-      adv_device_sig: Keyword.get(opts, :adv_device_sig, :crypto.strong_rand_bytes(64))
+      adv_device_sig: Keyword.get(opts, :adv_device_sig, :crypto.strong_rand_bytes(64)),
+      # Per-device fingerprint persona (UA/device-props). Caller passes a random
+      # one so numbers don't all look like the same client; nil falls back to
+      # the app-env/default persona at payload-build time.
+      persona: Keyword.get(opts, :persona)
     }
     |> Repo.insert()
   end
@@ -85,7 +89,35 @@ defmodule Whatsmeow.Store.Postgres do
   end
 
   @impl true
-  def list_devices, do: Repo.all(Schemas.Device)
+  @doc """
+  List every persisted device row.
+
+  By default returns the full table (legacy behavior — boot paths use
+  this). Pass `limit:` and `offset:` opts to paginate. For fleets >10k
+  devices, prefer `stream_devices/1` (called inside a Repo.transaction)
+  to avoid loading every row into memory at once.
+  """
+  def list_devices(opts \\ []) do
+    case Keyword.get(opts, :limit) do
+      nil ->
+        Repo.all(Schemas.Device)
+
+      limit when is_integer(limit) and limit > 0 ->
+        import Ecto.Query
+        offset = Keyword.get(opts, :offset, 0)
+        from(d in Schemas.Device, limit: ^limit, offset: ^offset) |> Repo.all()
+    end
+  end
+
+  @doc """
+  Stream every device row in batches of `:batch_size` (default 500).
+  Must be called inside a `Repo.transaction/1`.
+  """
+  @spec stream_devices(keyword()) :: Enumerable.t()
+  def stream_devices(opts \\ []) do
+    batch = Keyword.get(opts, :batch_size, 500)
+    Repo.stream(Schemas.Device, max_rows: batch)
+  end
 
   @impl true
   def delete_device(device_id) do
@@ -100,44 +132,49 @@ defmodule Whatsmeow.Store.Postgres do
         # envelope the recipient (and our own counter) can't decrypt.
         # Tables here are every Schema whose row is keyed on a JID we
         # own (`our_jid` / `jid`).
+        #
+        # All deletes + the final Device row delete run inside ONE
+        # transaction so a crash midway leaves the DB consistent (either
+        # nothing got deleted, or all of it did). The old form issued
+        # ~15 separate round-trips and could leave a half-cleaned device
+        # on partial failure.
         jid = device.jid
 
-        for {sql, params} <- [
-              {"DELETE FROM whatsmeow_sessions WHERE our_jid = $1", [jid]},
-              {"DELETE FROM whatsmeow_identity_keys WHERE our_jid = $1", [jid]},
-              {"DELETE FROM whatsmeow_sender_keys WHERE our_jid = $1", [jid]},
-              {"DELETE FROM whatsmeow_app_state_sync_keys WHERE our_jid = $1", [jid]},
-              {"DELETE FROM whatsmeow_app_state_version WHERE our_jid = $1", [jid]},
-              {"DELETE FROM whatsmeow_app_state_mutation_macs WHERE our_jid = $1", [jid]},
-              {"DELETE FROM whatsmeow_message_secrets WHERE our_jid = $1", [jid]},
-              {"DELETE FROM whatsmeow_chat_settings WHERE our_jid = $1", [jid]},
-              {"DELETE FROM whatsmeow_contacts WHERE our_jid = $1", [jid]},
-              {"DELETE FROM whatsmeow_privacy_tokens WHERE our_jid = $1", [jid]},
-              {"DELETE FROM whatsmeow_lid_map WHERE our_jid = $1", [jid]},
-              {"DELETE FROM whatsmeow_event_buffer WHERE our_jid = $1", [jid]},
-              {"DELETE FROM whatsmeow_retry_buffer WHERE our_jid = $1", [jid]},
-              {"DELETE FROM whatsmeow_nct_salt WHERE our_jid = $1", [jid]},
-              {"DELETE FROM whatsmeow_pre_keys WHERE jid = $1", [jid]}
-            ] do
-          # Each table is best-effort: schemas can be added in the
-          # future, and a host on an older migration may not have all
-          # of them yet. We log+continue rather than aborting the
-          # device delete.
-          try do
-            Ecto.Adapters.SQL.query!(Repo, sql, params)
-          rescue
-            e in [Postgrex.Error] ->
-              # `undefined_table` (42P01) — host hasn't migrated that
-              # table yet. Anything else (FK / privilege / syntax) is a
-              # real bug worth surfacing.
-              case e do
-                %Postgrex.Error{postgres: %{code: :undefined_table}} -> :ok
-                _ -> reraise(e, __STACKTRACE__)
-              end
+        Repo.transaction(fn ->
+          for {sql, params} <- [
+                {"DELETE FROM whatsmeow_sessions WHERE our_jid = $1", [jid]},
+                {"DELETE FROM whatsmeow_identity_keys WHERE our_jid = $1", [jid]},
+                {"DELETE FROM whatsmeow_sender_keys WHERE our_jid = $1", [jid]},
+                {"DELETE FROM whatsmeow_app_state_sync_keys WHERE our_jid = $1", [jid]},
+                {"DELETE FROM whatsmeow_app_state_version WHERE our_jid = $1", [jid]},
+                {"DELETE FROM whatsmeow_app_state_mutation_macs WHERE our_jid = $1", [jid]},
+                {"DELETE FROM whatsmeow_message_secrets WHERE our_jid = $1", [jid]},
+                {"DELETE FROM whatsmeow_chat_settings WHERE our_jid = $1", [jid]},
+                {"DELETE FROM whatsmeow_contacts WHERE our_jid = $1", [jid]},
+                {"DELETE FROM whatsmeow_privacy_tokens WHERE our_jid = $1", [jid]},
+                {"DELETE FROM whatsmeow_lid_map WHERE our_jid = $1", [jid]},
+                {"DELETE FROM whatsmeow_event_buffer WHERE our_jid = $1", [jid]},
+                {"DELETE FROM whatsmeow_retry_buffer WHERE our_jid = $1", [jid]},
+                {"DELETE FROM whatsmeow_nct_salt WHERE our_jid = $1", [jid]},
+                {"DELETE FROM whatsmeow_pre_keys WHERE jid = $1", [jid]}
+              ] do
+            # Each table is best-effort against an older migration that
+            # hasn't created it yet. `savepoint` so a missing table
+            # doesn't blow the outer transaction.
+            try do
+              Ecto.Adapters.SQL.query!(Repo, sql, params)
+            rescue
+              e in [Postgrex.Error] ->
+                case e do
+                  %Postgrex.Error{postgres: %{code: :undefined_table}} -> :ok
+                  _ -> Repo.rollback({:delete_device, e})
+                end
+            end
           end
-        end
 
-        Repo.delete(device)
+          Repo.delete!(device)
+        end)
+
         :ok
 
       {:error, _} = e ->

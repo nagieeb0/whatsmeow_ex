@@ -45,10 +45,27 @@ defmodule Whatsmeow.AppState.LTHash do
   def sub(base, items), do: apply_each(base, items, :sub)
 
   defp apply_each(base, items, op) do
-    Enum.reduce(items, base, fn item, acc ->
-      delta = HKDF.derive(item, <<0::256>>, @hkdf_info, @hkdf_size)
-      pointwise(acc, delta, op)
-    end)
+    # Memoize HKDF expansions across the patch. WhatsApp patches can
+    # carry duplicate `item` values (e.g. two `set value_mac` mutations
+    # for the same index) — without memoization we'd HKDF-derive each
+    # 128-byte expansion twice. The cache is local to this single call;
+    # it doesn't outlive `apply_each/3` so there's no cross-patch leak.
+    {result, _cache} =
+      Enum.reduce(items, {base, %{}}, fn item, {acc, cache} ->
+        {delta, cache} =
+          case Map.fetch(cache, item) do
+            {:ok, d} ->
+              {d, cache}
+
+            :error ->
+              d = HKDF.derive(item, <<0::256>>, @hkdf_info, @hkdf_size)
+              {d, Map.put(cache, item, d)}
+          end
+
+        {pointwise(acc, delta, op), cache}
+      end)
+
+    result
   end
 
   @doc """

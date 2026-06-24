@@ -41,6 +41,34 @@ defmodule Whatsmeow.ClientPayload.Persona do
   @spec default() :: t()
   def default, do: %__MODULE__{}
 
+  # Realistic locales to spread across devices so they don't all advertise en-US.
+  @locales [
+    {"en", "US"},
+    {"en", "GB"},
+    {"pt", "BR"},
+    {"es", "ES"},
+    {"fr", "FR"},
+    {"ar", "EG"},
+    {"de", "DE"},
+    {"it", "IT"},
+    {"id", "ID"},
+    {"tr", "TR"}
+  ]
+
+  @doc """
+  A random persona — a random OS preset (macOS/Windows/Linux) with a random
+  realistic locale. Assign one per device at creation so every paired number
+  presents an independent device fingerprint instead of an identical one.
+  Pinned on the `Device.persona` row at creation, so it stays stable across
+  reconnects for that JID (a changing UA is itself a tell).
+  """
+  @spec random() :: t()
+  def random do
+    base = Enum.random([mac_os(), windows(), linux()])
+    {lang, country} = Enum.random(@locales)
+    %{base | locale_language: lang, locale_country: country}
+  end
+
   @doc """
   Resolve the persona to use for `device`. Prefers the device's persisted
   persona; falls back to app-env; finally `default/0`.

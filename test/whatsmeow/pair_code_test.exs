@@ -73,7 +73,9 @@ defmodule Whatsmeow.PairCodeTest do
       [reg] = iq.content
       assert reg.tag == "link_code_companion_reg"
       assert reg.attrs["stage"] == "companion_hello"
-      assert reg.attrs["jid"] == "447400000000@s.whatsapp.net"
+      # jid is a %JID{} struct so the binary encoder emits the @jid_pair opcode
+      # (a plain string makes the server silently drop the IQ).
+      assert to_string(reg.attrs["jid"]) == "447400000000@s.whatsapp.net"
       assert reg.attrs["should_show_push_notification"] == "true"
 
       child_tags = Enum.map(reg.content, & &1.tag)

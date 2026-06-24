@@ -47,7 +47,9 @@ defmodule Whatsmeow.Repo.Migrations.CreateWhatsmeowSchema do
           type: :text,
           on_delete: :delete_all,
           on_update: :update_all
-        ), primary_key: true)
+        ),
+        primary_key: true
+      )
 
       add(:their_id, :text, primary_key: true)
       add(:identity, :binary, null: false)
@@ -61,7 +63,9 @@ defmodule Whatsmeow.Repo.Migrations.CreateWhatsmeowSchema do
           type: :text,
           on_delete: :delete_all,
           on_update: :update_all
-        ), primary_key: true)
+        ),
+        primary_key: true
+      )
 
       add(:key_id, :integer, primary_key: true)
       add(:key, :binary, null: false)
@@ -76,7 +80,9 @@ defmodule Whatsmeow.Repo.Migrations.CreateWhatsmeowSchema do
           type: :text,
           on_delete: :delete_all,
           on_update: :update_all
-        ), primary_key: true)
+        ),
+        primary_key: true
+      )
 
       add(:their_id, :text, primary_key: true)
       add(:session, :binary)
@@ -90,7 +96,9 @@ defmodule Whatsmeow.Repo.Migrations.CreateWhatsmeowSchema do
           type: :text,
           on_delete: :delete_all,
           on_update: :update_all
-        ), primary_key: true)
+        ),
+        primary_key: true
+      )
 
       add(:chat_id, :text, primary_key: true)
       add(:sender_id, :text, primary_key: true)
@@ -105,7 +113,9 @@ defmodule Whatsmeow.Repo.Migrations.CreateWhatsmeowSchema do
           type: :text,
           on_delete: :delete_all,
           on_update: :update_all
-        ), primary_key: true)
+        ),
+        primary_key: true
+      )
 
       add(:key_id, :binary, primary_key: true)
       add(:key_data, :binary, null: false)
@@ -121,7 +131,9 @@ defmodule Whatsmeow.Repo.Migrations.CreateWhatsmeowSchema do
           type: :text,
           on_delete: :delete_all,
           on_update: :update_all
-        ), primary_key: true)
+        ),
+        primary_key: true
+      )
 
       add(:name, :text, primary_key: true)
       add(:version, :bigint, null: false)
@@ -144,7 +156,9 @@ defmodule Whatsmeow.Repo.Migrations.CreateWhatsmeowSchema do
           type: :text,
           on_delete: :delete_all,
           on_update: :update_all
-        ), primary_key: true)
+        ),
+        primary_key: true
+      )
 
       add(:their_jid, :text, primary_key: true)
       add(:first_name, :text)
@@ -162,7 +176,9 @@ defmodule Whatsmeow.Repo.Migrations.CreateWhatsmeowSchema do
           type: :text,
           on_delete: :delete_all,
           on_update: :update_all
-        ), primary_key: true)
+        ),
+        primary_key: true
+      )
 
       add(:chat_jid, :text, primary_key: true)
       add(:muted_until, :bigint, null: false, default: 0)
@@ -178,7 +194,9 @@ defmodule Whatsmeow.Repo.Migrations.CreateWhatsmeowSchema do
           type: :text,
           on_delete: :delete_all,
           on_update: :update_all
-        ), primary_key: true)
+        ),
+        primary_key: true
+      )
 
       add(:chat_jid, :text, primary_key: true)
       add(:sender_jid, :text, primary_key: true)
@@ -208,7 +226,9 @@ defmodule Whatsmeow.Repo.Migrations.CreateWhatsmeowSchema do
           type: :text,
           on_delete: :delete_all,
           on_update: :update_all
-        ), primary_key: true)
+        ),
+        primary_key: true
+      )
 
       add(:salt, :binary, null: false)
     end
@@ -228,7 +248,10 @@ defmodule Whatsmeow.Repo.Migrations.CreateWhatsmeowSchema do
           type: :text,
           on_delete: :delete_all,
           on_update: :update_all
-        ), primary_key: true, null: false)
+        ),
+        primary_key: true,
+        null: false
+      )
 
       add(:ciphertext_hash, :binary, primary_key: true, null: false)
       add(:plaintext, :binary)
@@ -244,7 +267,10 @@ defmodule Whatsmeow.Repo.Migrations.CreateWhatsmeowSchema do
           type: :text,
           on_delete: :delete_all,
           on_update: :update_all
-        ), primary_key: true, null: false)
+        ),
+        primary_key: true,
+        null: false
+      )
 
       add(:chat_jid, :text, primary_key: true, null: false)
       add(:message_id, :text, primary_key: true, null: false)

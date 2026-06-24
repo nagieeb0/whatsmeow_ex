@@ -84,10 +84,21 @@ defmodule Whatsmeow.PreKeys do
   """
   @spec generate(non_neg_integer(), non_neg_integer()) :: [prekey()]
   def generate(count, start_id) when is_integer(count) and count > 0 and is_integer(start_id) do
-    for offset <- 0..(count - 1) do
-      {pub, priv} = Curve25519.generate_keypair()
-      %{key_id: start_id + offset, priv: priv, pub: pub}
-    end
+    # Curve25519 keypair generation is independent per key — fan out
+    # across schedulers for the big initial 812-key upload. We need
+    # `ordered: true` so the returned list still maps 1:1 onto
+    # `start_id + offset`.
+    0..(count - 1)
+    |> Task.async_stream(
+      fn offset ->
+        {pub, priv} = Curve25519.generate_keypair()
+        %{key_id: start_id + offset, priv: priv, pub: pub}
+      end,
+      max_concurrency: Whatsmeow.Config.send_concurrency(),
+      ordered: true,
+      timeout: 60_000
+    )
+    |> Enum.map(fn {:ok, key} -> key end)
   end
 
   # ---------------------------------------------------------------------
@@ -192,7 +203,7 @@ defmodule Whatsmeow.PreKeys do
       if needed > 0 do
         start_id = next_id(our_jid)
         keys = generate(needed, start_id)
-        _ = Enum.each(keys, &persist_prekey(our_jid, &1))
+        _ = persist_prekeys_bulk(our_jid, keys)
         keys
       else
         []
@@ -222,13 +233,25 @@ defmodule Whatsmeow.PreKeys do
     end
   end
 
-  defp persist_prekey(our_jid, %{key_id: id, priv: priv}) do
-    %PreKey{}
-    |> PreKey.changeset(%{jid: our_jid, key_id: id, key: priv, uploaded: false})
-    |> Whatsmeow.Repo.insert(
-      on_conflict: {:replace, [:key, :uploaded]},
-      conflict_target: [:jid, :key_id]
-    )
+  # Bulk insert path used by `get_or_generate/2`. At pairing we mint
+  # 812 keys at once — issuing 812 individual `Repo.insert/2` calls used
+  # to stall the post-login bootstrap by ~800 ms. `insert_all` chunks
+  # the writes into 200-row batches to stay well under Postgres's
+  # 65 535-parameter limit (4 cols × 200 = 800).
+  defp persist_prekeys_bulk(our_jid, keys) when is_list(keys) do
+    keys
+    |> Enum.chunk_every(200)
+    |> Enum.each(fn chunk ->
+      entries =
+        Enum.map(chunk, fn %{key_id: id, priv: priv} ->
+          %{jid: our_jid, key_id: id, key: priv, uploaded: false}
+        end)
+
+      Whatsmeow.Repo.insert_all(PreKey, entries,
+        on_conflict: {:replace, [:key, :uploaded]},
+        conflict_target: [:jid, :key_id]
+      )
+    end)
   end
 
   @doc """

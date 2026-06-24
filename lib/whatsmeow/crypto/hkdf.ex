@@ -48,12 +48,16 @@ defmodule Whatsmeow.Crypto.HKDF do
       raise ArgumentError, "HKDF expand length #{length} exceeds 255 * HashLen"
     end
 
-    {okm, _last} =
-      Enum.reduce(1..n, {<<>>, <<>>}, fn i, {acc, prev} ->
-        t = :crypto.mac(:hmac, @hash_algo, prk, prev <> info <> <<i>>)
-        {acc <> t, t}
+    # iolist accumulator avoids the O(n²) binary copies the old
+    # `acc <> t` form produced. For typical Signal HKDFs (n in 1..3)
+    # the savings are small in absolute terms, but for app-state /
+    # media key expansion (n up to 8) they add up.
+    {okm_io, _last} =
+      Enum.reduce(1..n, {[], <<>>}, fn i, {acc, prev} ->
+        t = :crypto.mac(:hmac, @hash_algo, prk, [prev, info, <<i>>])
+        {[acc, t], t}
       end)
 
-    binary_part(okm, 0, length)
+    binary_part(IO.iodata_to_binary(okm_io), 0, length)
   end
 end

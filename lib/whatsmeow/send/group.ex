@@ -173,27 +173,44 @@ defmodule Whatsmeow.Send.Group do
   # --- Fanout ----------------------------------------------------------------
 
   defp fanout_skdm(server, %Device{} = device, devices, skdm_plaintext, opts) do
+    # Same fanout shape as DM (`Whatsmeow.Send.parallel_fanout/2`) but
+    # we also need the *error* list so we can surface `{:fanout, errs}`
+    # when zero devices encrypted — group sends to a moribund group
+    # need the diagnostic. Hence the local `Task.async_stream` instead
+    # of reusing `parallel_fanout/2`.
     {nodes, sessions, errs, any_pkmsg?} =
-      Enum.reduce(devices, {[], [], [], false}, fn ad_jid,
-                                                   {nodes_acc, sessions_acc, errs_acc, pkmsg?} ->
-        case Send.encrypt_plaintext_for_peer(server, device, ad_jid, skdm_plaintext, opts) do
-          {:ok, envelope, enc_type, new_sess} ->
-            participant = build_participant_node(ad_jid, envelope, enc_type)
+      devices
+      |> Task.async_stream(
+        fn ad_jid ->
+          {ad_jid, Send.encrypt_plaintext_for_peer(server, device, ad_jid, skdm_plaintext, opts)}
+        end,
+        max_concurrency: Whatsmeow.Config.send_concurrency(),
+        ordered: false,
+        timeout: Whatsmeow.Config.fanout_task_timeout_ms(),
+        on_timeout: :kill_task
+      )
+      |> Enum.reduce({[], [], [], false}, fn
+        {:ok, {%JID{} = ad_jid, {:ok, envelope, enc_type, new_sess}}},
+        {nodes_acc, sessions_acc, errs_acc, pkmsg?} ->
+          participant = build_participant_node(ad_jid, envelope, enc_type)
 
-            {
-              [participant | nodes_acc],
-              [{ad_jid, new_sess} | sessions_acc],
-              errs_acc,
-              pkmsg? or enc_type == "pkmsg"
-            }
+          {
+            [participant | nodes_acc],
+            [{ad_jid, new_sess} | sessions_acc],
+            errs_acc,
+            pkmsg? or enc_type == "pkmsg"
+          }
 
-          {:error, reason} ->
-            Logger.warning(
-              "[whatsmeow] group fanout: skipped #{JID.to_string(ad_jid)}: #{inspect(reason)}"
-            )
+        {:ok, {%JID{} = ad_jid, {:error, reason}}}, {nodes_acc, sessions_acc, errs_acc, pkmsg?} ->
+          Logger.warning(
+            "[whatsmeow] group fanout: skipped #{JID.to_string(ad_jid)}: #{inspect(reason)}"
+          )
 
-            {nodes_acc, sessions_acc, [{ad_jid, reason} | errs_acc], pkmsg?}
-        end
+          {nodes_acc, sessions_acc, [{ad_jid, reason} | errs_acc], pkmsg?}
+
+        {:exit, reason}, {nodes_acc, sessions_acc, errs_acc, pkmsg?} ->
+          Logger.warning("[whatsmeow] group fanout: task crashed: #{inspect(reason)}")
+          {nodes_acc, sessions_acc, [{:task_crashed, reason} | errs_acc], pkmsg?}
       end)
 
     case {nodes, errs} do
@@ -327,13 +344,10 @@ defmodule Whatsmeow.Send.Group do
   end
 
   defp persist_per_device_sessions(our_jid, sessions) do
-    if repo_up?() do
-      Enum.each(sessions, fn {%JID{} = ad_jid, new_sess} ->
-        _ = Whatsmeow.Signal.Decrypt.persist_session(our_jid, JID.to_string(ad_jid), new_sess)
-      end)
-    end
-
-    :ok
+    # Wrap the per-device upserts in a single transaction so N recipients
+    # cost one round-trip total, not N. `Send.persist_sessions_batch/2`
+    # already handles the no-Repo fallback.
+    Send.persist_sessions_batch(our_jid, sessions)
   end
 
   defp repo_up? do

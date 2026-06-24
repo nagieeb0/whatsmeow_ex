@@ -19,7 +19,9 @@ defmodule Whatsmeow.Application do
        keys: :unique, name: Whatsmeow.Sessions.Registry, partitions: System.schedulers_online()},
       {DynamicSupervisor, name: Whatsmeow.Sessions.Supervisor, strategy: :one_for_one},
       {Task.Supervisor, name: Whatsmeow.Media.TaskSup},
+      {Task.Supervisor, name: Whatsmeow.Sessions.TaskSup},
       Whatsmeow.Retry.RecentCache,
+      Whatsmeow.Media.HKDFCache,
       Whatsmeow.WAVersion.Refresher
     ]
   end
@@ -32,7 +34,9 @@ defmodule Whatsmeow.Application do
        keys: :unique, name: Whatsmeow.Sessions.Registry, partitions: System.schedulers_online()},
       {DynamicSupervisor, name: Whatsmeow.Sessions.Supervisor, strategy: :one_for_one},
       {Task.Supervisor, name: Whatsmeow.Media.TaskSup},
+      {Task.Supervisor, name: Whatsmeow.Sessions.TaskSup},
       Whatsmeow.Retry.RecentCache,
+      Whatsmeow.Media.HKDFCache,
       Whatsmeow.WAVersion.Refresher
     ]
   end

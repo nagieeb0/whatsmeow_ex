@@ -58,9 +58,11 @@ defmodule Whatsmeow.Session do
   require Logger
 
   alias Whatsmeow.Binary
+  alias Whatsmeow.Crypto.Curve25519
   alias Whatsmeow.IQ
   alias Whatsmeow.Login
   alias Whatsmeow.Pair
+  alias Whatsmeow.PairCode
   alias Whatsmeow.Store.Schemas.Device
   alias Whatsmeow.Transport.{Frame, Handshake, NoiseHandshake, NoiseSocket}
   alias Whatsmeow.Types.Events
@@ -73,6 +75,13 @@ defmodule Whatsmeow.Session do
   # Backoff: 1s, 2s, 4s, … capped.
   @reconnect_initial_ms 1_000
   @reconnect_max_ms 300_000
+
+  # Per-message-id retry counter ETS table. See `bump_retry_count/1`.
+  @retry_count_table :whatsmeow_message_retries
+  # Drop retry-count rows older than this on each sweep.
+  @retry_count_ttl_s 86_400
+  # Sweep cadence — every hour.
+  @retry_count_sweep_ms 3_600_000
 
   defstruct [
     :device_id,
@@ -98,6 +107,10 @@ defmodule Whatsmeow.Session do
     # fired. We now buffer the queue here and pop one at a time.
     :qr_emit_queue,
     :qr_emit_timer,
+    # Cached PairCode.HelloResult while a phone-number ("link with phone")
+    # pairing is mid-flight, between the companion_hello and the inbound
+    # link_code_companion_reg notification. nil at all other times.
+    :pair_code,
     pending: %{}
   ]
 
@@ -125,7 +138,8 @@ defmodule Whatsmeow.Session do
           keepalive_timer: reference() | nil,
           keepalive_failures: non_neg_integer(),
           auto_reconnect?: boolean(),
-          pending: %{optional(String.t()) => :keepalive | {pid(), reference()}}
+          pending: %{optional(String.t()) => :keepalive | {pid(), reference()}},
+          pair_code: PairCode.HelloResult.t() | nil
         }
 
   # --- Public API -----------------------------------------------------------
@@ -211,6 +225,34 @@ defmodule Whatsmeow.Session do
   @spec get_device(pid() | String.t()) :: {:ok, Device.t()} | {:error, :no_device}
   def get_device(server), do: GenServer.call(via_or_pid(server), :get_device)
 
+  @doc """
+  Begin phone-number ("link with phone number") pairing.
+
+  Sends the `companion_hello` IQ for `phone` (international format; non-digit
+  characters are stripped) and returns the user-facing 8-character linking
+  code (`"XXXX-XXXX"`). The user types it into WhatsApp on their primary
+  phone under *Linked Devices → Link with phone number*.
+
+  The handshake finishes automatically: the session catches the inbound
+  `link_code_companion_reg` notification, derives the adv-secret, and replies
+  with `companion_finish`. A normal `%Events.PairSuccess{}` is broadcast once
+  the server confirms — identical to the QR flow from there on.
+
+  Must be called from outside the session process (it blocks on `send_iq`),
+  with the session already connected.
+  """
+  @spec pair_phone(pid() | String.t(), String.t(), keyword()) ::
+          {:ok, String.t()} | {:error, term()}
+  def pair_phone(server, phone, opts \\ []) when is_binary(phone) do
+    with {:ok, %Device{noise_key: noise_key} = _device} <- get_device(server),
+         noise_pub = Curve25519.public_for(noise_key),
+         {:ok, code, %PairCode.HelloResult{} = hello} <-
+           PairCode.start_link(server, phone, Keyword.put(opts, :noise_pub, noise_pub)) do
+      :ok = GenServer.call(via_or_pid(server), {:set_pair_code, hello})
+      {:ok, code}
+    end
+  end
+
   @doc "Stop the session (graceful)."
   @spec stop(pid() | String.t()) :: :ok
   def stop(server), do: GenServer.stop(via_or_pid(server), :normal)
@@ -261,6 +303,9 @@ defmodule Whatsmeow.Session do
 
     Process.flag(:trap_exit, true)
 
+    ensure_retry_table()
+    Process.send_after(self(), :retry_count_sweep, @retry_count_sweep_ms)
+
     {:ok,
      %__MODULE__{
        device_id: device_id,
@@ -306,6 +351,10 @@ defmodule Whatsmeow.Session do
     {:reply, {:ok, device}, state}
   end
 
+  def handle_call({:set_pair_code, hello}, _from, state) do
+    {:reply, :ok, %{state | pair_code: hello}}
+  end
+
   def handle_call({:send_iq, iq, caller_pid, ref}, _from, %__MODULE__{status: status} = state)
       when status in [:connected, :authenticated] do
     id = Binary.Node.attr(iq, "id")
@@ -315,7 +364,9 @@ defmodule Whatsmeow.Session do
     case do_send_node(state, iq) do
       {:ok, state2} when is_binary(id) and id != "" ->
         Logger.debug(
-          "[whatsmeow] iq sent id=#{id} type=#{iq_type} xmlns=#{inspect(xmlns)} pending=#{map_size(state2.pending) + 1}",
+          fn ->
+            "[whatsmeow] iq sent id=#{id} type=#{iq_type} xmlns=#{inspect(xmlns)} pending=#{map_size(state2.pending) + 1}"
+          end,
           device_id: state.device_id
         )
 
@@ -557,6 +608,19 @@ defmodule Whatsmeow.Session do
 
   def handle_info({:EXIT, _, _reason}, state), do: {:noreply, state}
 
+  def handle_info(:retry_count_sweep, state) do
+    deleted = __retry_count_sweep__()
+
+    if deleted > 0 do
+      Logger.debug(fn -> "[whatsmeow] retry-count sweep dropped #{deleted} stale rows" end,
+        device_id: state.device_id
+      )
+    end
+
+    Process.send_after(self(), :retry_count_sweep, @retry_count_sweep_ms)
+    {:noreply, state}
+  end
+
   def handle_info(:post_login_bootstrap, %__MODULE__{status: :authenticated} = state) do
     # Send the post-login set-passive(false) + presence. The server
     # quietly drops idle sessions if these don't show up shortly after
@@ -732,6 +796,14 @@ defmodule Whatsmeow.Session do
         device_id: state.device_id
       )
 
+      # Sync broadcast — `Phoenix.PubSub.broadcast/3` is ~1 µs/subscriber
+      # locally, and `send/2` itself is non-blocking (the only thing that
+      # actually waits is enqueue, which is essentially instant). The
+      # earlier async-via-Task wrapper hurt rather than helped: it added
+      # ~15 µs of spawn overhead AND broke per-subscriber FIFO ordering,
+      # because two Tasks from different pids have no message-ordering
+      # guarantee to the same subscriber. Stay sync here so agents
+      # (Jido, etc.) see messages in wire order.
       Whatsmeow.Notifications.broadcast(state.device_id, receipt)
     end
 
@@ -741,13 +813,24 @@ defmodule Whatsmeow.Session do
   end
 
   defp dispatch_node(state, %Binary.Node{tag: "notification"} = node) do
-    # Some `<notification>` flavours carry data we want to persist
-    # before we ack. The big one is `type="devices"` — it announces
-    # LID ↔ phone pairings as peers add/remove linked devices. Without
-    # snarfing these into `whatsmeow_lid_map`, every privacy-LID peer
-    # arrives at the chatbot as an anonymous LID and the agent has to
-    # ask "who are you?" even when we already know them by phone.
-    _ = maybe_persist_lid_map(node)
+    # Phone-number pairing: the primary phone's response arrives as a
+    # `<notification>` carrying `<link_code_companion_reg>`. Finish the
+    # handshake (derive the adv-secret, send `companion_finish`) before we
+    # ack, so the follow-up `<pair-success>` verifies. Only when a pairing
+    # is actually mid-flight (`pair_code` cached).
+    state =
+      if state.pair_code && Binary.Node.get_child(node, "link_code_companion_reg") do
+        on_code_pair_notification(state, node)
+      else
+        # Some `<notification>` flavours carry data we want to persist
+        # before we ack. The big one is `type="devices"` — it announces
+        # LID ↔ phone pairings as peers add/remove linked devices. Without
+        # snarfing these into `whatsmeow_lid_map`, every privacy-LID peer
+        # arrives at the chatbot as an anonymous LID and the agent has to
+        # ask "who are you?" even when we already know them by phone.
+        _ = maybe_persist_lid_map(node)
+        state
+      end
 
     ack = Whatsmeow.Receipt.build_ack(node)
     {:ok, state2} = do_send_node(state, ack) |> ok_or_keep(state)
@@ -765,17 +848,19 @@ defmodule Whatsmeow.Session do
     # logger formatter drops keyword metadata, which made silent-drop
     # diagnostics impossible (IQ responses got lost here without anyone
     # seeing which tag was on the wire).
-    attrs_preview =
-      case node do
-        %Binary.Node{attrs: %{} = a} ->
-          a |> Enum.take(5) |> Enum.map_join(",", fn {k, v} -> "#{k}=#{inspect(v)}" end)
-
-        _ ->
-          ""
-      end
-
     Logger.debug(
-      "[whatsmeow] unhandled inbound tag=#{tag} attrs=#{attrs_preview}",
+      fn ->
+        attrs_preview =
+          case node do
+            %Binary.Node{attrs: %{} = a} ->
+              a |> Enum.take(5) |> Enum.map_join(",", fn {k, v} -> "#{k}=#{inspect(v)}" end)
+
+            _ ->
+              ""
+          end
+
+        "[whatsmeow] unhandled inbound tag=#{tag} attrs=#{attrs_preview}"
+      end,
       device_id: state.device_id
     )
 
@@ -856,7 +941,12 @@ defmodule Whatsmeow.Session do
               retry =
                 Whatsmeow.Receipt.build_retry_receipt(msg,
                   count: count,
-                  registration_id: state.device.registration_id,
+                  # Coerce a missing registration_id to 0 — happens in
+                  # test fixtures and on a not-yet-fully-paired device.
+                  # `build_retry_receipt/2` documents `0` as the default
+                  # already; we just enforce it here so a nil from an
+                  # unfinished `%Device{}` doesn't blow the binary cons.
+                  registration_id: state.device.registration_id || 0,
                   keys: keys
                 )
 
@@ -901,6 +991,10 @@ defmodule Whatsmeow.Session do
       {:ok, %{plaintext: plain}} ->
         case Whatsmeow.Signal.MessageBuilder.from_plaintext(plain, info) do
           {:ok, typed_msg, attachments} ->
+            # Sync — see comment in receipt branch above. Per-chat
+            # ordering at the subscriber depends on these being sent
+            # FROM THE SAME PID (the session GenServer). Task-spawn
+            # broadcasts shatter that guarantee.
             Whatsmeow.Notifications.broadcast(state.device_id, %Events.Message{
               device_id: state.device_id,
               message: typed_msg,
@@ -1068,21 +1162,52 @@ defmodule Whatsmeow.Session do
   # arrive multiple times — server replays until we successfully
   # decrypt). Initialised lazily on first use. Mirrors Go's
   # `cli.messageRetries` map.
-  @retry_count_table :whatsmeow_message_retries
+  #
+  # Tuple shape: `{msg_id, count, last_ts_seconds}`. The third element
+  # is updated on every bump so the periodic `:retry_count_sweep` (see
+  # `init/1`) can drop entries older than 24 h — without it the table
+  # grew unboundedly under sustained load.
 
   defp bump_retry_count(nil), do: 1
 
   defp bump_retry_count(msg_id) when is_binary(msg_id) do
+    ensure_retry_table()
+    now = System.system_time(:second)
+    count = :ets.update_counter(@retry_count_table, msg_id, {2, 1}, {msg_id, 0, now})
+    _ = :ets.update_element(@retry_count_table, msg_id, {3, now})
+    count
+  end
+
+  defp ensure_retry_table do
     case :ets.info(@retry_count_table) do
       :undefined ->
-        _ = :ets.new(@retry_count_table, [:public, :named_table, :set])
+        _ =
+          :ets.new(@retry_count_table, [
+            :public,
+            :named_table,
+            :set,
+            read_concurrency: true,
+            write_concurrency: true
+          ])
+
         :ok
 
       _ ->
         :ok
     end
+  end
 
-    :ets.update_counter(@retry_count_table, msg_id, {2, 1}, {msg_id, 0})
+  @doc false
+  # Drop retry-count rows older than `@retry_count_ttl_s`. Public-ish for
+  # tests; production callers should rely on the scheduled sweep.
+  def __retry_count_sweep__(now \\ System.system_time(:second)) do
+    ensure_retry_table()
+    cutoff = now - @retry_count_ttl_s
+    # `match_delete` with a guard would require `:ets.fun2ms` at compile
+    # time; an `ets.select_delete` with a `>=` guard on the timestamp
+    # field is simpler and just as fast for our table sizes.
+    spec = [{{:_, :_, :"$1"}, [{:<, :"$1", cutoff}], [true]}]
+    :ets.select_delete(@retry_count_table, spec)
   end
 
   # Build the 4-tuple consumed by `Whatsmeow.Receipt.build_retry_receipt`'s
@@ -1294,6 +1419,52 @@ defmodule Whatsmeow.Session do
         })
 
         state
+    end
+  end
+
+  # --- phone-number pairing → companion_finish -----------------------------
+
+  # The primary phone just sent its wrapped ephemeral pub + identity pub.
+  # Derive the ephemeral + identity shared secrets, set our adv-secret to the
+  # derived value (so the upcoming `<pair-success>` HMAC verifies against it),
+  # and reply with `companion_finish`. The derived adv-secret rides along on
+  # `state.device` and gets persisted by `on_pair_success`.
+  # Mirrors Go's `handleCodePairNotification` (`pair-code.go:150`).
+  defp on_code_pair_notification(state, node) do
+    %PairCode.HelloResult{keypair: {_pub, eph_priv}, linking_code: code, jid: jid} =
+      state.pair_code
+
+    device = state.device
+
+    with {:ok, parsed} <- PairCode.parse_pair_notification(node),
+         {:ok, eph_shared} <-
+           PairCode.unwrap_primary_ephemeral_pub(parsed.wrapped_primary_pub, code, eph_priv) do
+      identity_shared = Curve25519.agree(device.identity_key, parsed.primary_identity_pub)
+      adv_random = :crypto.strong_rand_bytes(32)
+      adv_secret = PairCode.derive_adv_secret(eph_shared, identity_shared, adv_random)
+      our_identity_pub = Curve25519.public_for(device.identity_key)
+
+      wrapped_bundle =
+        PairCode.wrap_key_bundle(
+          eph_shared,
+          our_identity_pub,
+          parsed.primary_identity_pub,
+          adv_random
+        )
+
+      finish_iq =
+        PairCode.build_finish_iq(jid, wrapped_bundle, our_identity_pub, parsed.pairing_ref)
+
+      new_state = %{state | device: %{device | adv_key: adv_secret}, pair_code: nil}
+      {:ok, state2} = do_send_node(new_state, finish_iq) |> ok_or_keep(new_state)
+      state2
+    else
+      error ->
+        Logger.error("[whatsmeow] phone-pair finish failed reason=#{inspect(error)}",
+          device_id: state.device_id
+        )
+
+        %{state | pair_code: nil}
     end
   end
 

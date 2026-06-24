@@ -84,7 +84,13 @@ defmodule Whatsmeow.Media.Download do
       ct_len = byte_size(body) - 10
       <<ct::binary-size(ct_len), tag::binary-size(10)>> = body
 
-      expansion = HKDF.derive(media_key, <<0::256>>, info_for(media_type), 112)
+      # Cache the 112-byte HKDF expansion by `{media_key, info_for/1}` —
+      # bursts of inbound media (album fanout, history-sync replay) hit
+      # the same media_key+info pair repeatedly. Cache miss falls
+      # through to `HKDF.derive/4`; absent cache table (boot path /
+      # tests) is also handled by the helper.
+      info = info_for(media_type)
+      expansion = cached_or_derive(media_key, info)
 
       <<iv::binary-size(16), enc_key::binary-size(32), mac_key::binary-size(32),
         _ref_key::binary-size(32)>> = expansion
@@ -205,4 +211,16 @@ defmodule Whatsmeow.Media.Download do
   defp info_for(:audio), do: "WhatsApp Audio Keys"
   defp info_for(:document), do: "WhatsApp Document Keys"
   defp info_for(:sticker), do: "WhatsApp Image Keys"
+
+  defp cached_or_derive(media_key, info) do
+    case Whatsmeow.Media.HKDFCache.get(media_key, info) do
+      nil ->
+        bytes = HKDF.derive(media_key, <<0::256>>, info, 112)
+        _ = Whatsmeow.Media.HKDFCache.put(media_key, info, bytes)
+        bytes
+
+      bytes ->
+        bytes
+    end
+  end
 end

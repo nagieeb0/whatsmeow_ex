@@ -14,7 +14,7 @@ defmodule Whatsmeow.Argo.Varint do
   def unsigned_encode(0), do: <<0>>
 
   def unsigned_encode(n) when is_integer(n) and n > 0 do
-    do_unsigned_encode(n, <<>>)
+    n |> do_unsigned_encode([]) |> :erlang.iolist_to_binary()
   end
 
   defp do_unsigned_encode(0, acc), do: acc
@@ -24,9 +24,9 @@ defmodule Whatsmeow.Argo.Varint do
     rest = Bitwise.bsr(n, 7)
 
     if rest == 0 do
-      <<acc::binary, byte>>
+      [acc, byte]
     else
-      do_unsigned_encode(rest, <<acc::binary, Bitwise.bor(byte, 0x80)>>)
+      do_unsigned_encode(rest, [acc, Bitwise.bor(byte, 0x80)])
     end
   end
 

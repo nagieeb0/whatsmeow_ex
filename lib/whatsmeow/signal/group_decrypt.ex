@@ -42,6 +42,14 @@ defmodule Whatsmeow.Signal.GroupDecrypt do
   alias Whatsmeow.Signal.SenderKeyWire.SenderKeyMessage
 
   @info "WhisperGroup"
+  # Cap how many skipped message keys we keep per (chat, sender) session.
+  # libsignal-java tolerates a 2000-iteration jump but stores all 2000
+  # intermediate keys — a misbehaving / replayed peer could blow out
+  # session memory. We keep at most this many of the most-recent
+  # iterations; older entries are dropped (treated as duplicate-message
+  # on the off chance they arrive later, which mirrors libsignal's
+  # `MAX_MESSAGE_KEYS = 2000` once exceeded).
+  @skipped_keys_cap 500
 
   @typedoc "Reasons a group decrypt may fail."
   @type error ::
@@ -163,7 +171,7 @@ defmodule Whatsmeow.Signal.GroupDecrypt do
           acc
           | chain_key: next_ck,
             iteration: n + 1,
-            skipped_keys: Map.put(acc.skipped_keys, n, mk)
+            skipped_keys: cap_skipped_keys(Map.put(acc.skipped_keys, n, mk))
         }
       end
     )
@@ -171,6 +179,22 @@ defmodule Whatsmeow.Signal.GroupDecrypt do
       {next_ck, mk} = Ratchet.kdf_ck(ck)
       {:ok, %GroupSession{acc | chain_key: next_ck, iteration: cur + 1}, mk}
     end)
+  end
+
+  # Trim the skipped-key map to the most recent `@skipped_keys_cap`
+  # iterations. Iteration numbers grow monotonically, so we evict the
+  # smallest ones — they're the oldest and least likely to still be
+  # in-flight.
+  defp cap_skipped_keys(map) when map_size(map) <= @skipped_keys_cap, do: map
+
+  defp cap_skipped_keys(map) do
+    over = map_size(map) - @skipped_keys_cap
+
+    map
+    |> Map.keys()
+    |> Enum.sort()
+    |> Enum.take(over)
+    |> Enum.reduce(map, fn k, acc -> Map.delete(acc, k) end)
   end
 
   defp derive_keys(message_key) when byte_size(message_key) == 32 do

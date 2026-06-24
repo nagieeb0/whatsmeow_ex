@@ -433,9 +433,102 @@ defmodule Mix.Tasks.Whatsmeow.Smoke do
 
         System.halt(1)
 
+      # Mint's 4-tuple error form. When the server pushes a frame and then
+      # closes (the typical `<stream:error>` / `<failure>` shape), Mint
+      # returns `{:error, conn, transport_error, responses}` where
+      # `responses` already contains the data we need to decrypt.
+      # Extract that data, frame-decode + Noise-decrypt it, and report
+      # the actual stanza instead of swallowing it.
+      {:error, _conn, transport_err, responses} when is_list(responses) ->
+        Mix.shell().error("      ✗ Server closed after sending a frame (#{inspect(transport_err)})")
+        decode_and_report_final_frame(state, responses)
+        System.halt(1)
+
       other ->
         Mix.shell().error("      ✗ recv error after relogin: #{inspect(other)}")
         System.halt(1)
+    end
+  end
+
+  # Pull data chunks out of Mint's `responses` list, concatenate into a WS
+  # payload, frame-decode it, then Noise-decrypt each frame and pretty-print
+  # whatever the server said. Best-effort — if anything fails we just dump
+  # the hex so the user (or this task's author) can debug from raw bytes.
+  defp decode_and_report_final_frame(state, responses) do
+    ws_bytes =
+      responses
+      |> Enum.flat_map(fn
+        {:data, _ref, bytes} -> [bytes]
+        _ -> []
+      end)
+      |> IO.iodata_to_binary()
+
+    if ws_bytes == "" do
+      Mix.shell().info("        (no data in final frame — server hung up clean)")
+    else
+      Mix.shell().info("        raw bytes (#{byte_size(ws_bytes)}): #{Base.encode16(ws_bytes)}")
+
+      # Strip the WS frame header (opcode 0x82 + length).
+      payload =
+        case ws_bytes do
+          <<0x82, len, rest::binary>> when len < 126 ->
+            <<chunk::binary-size(len), _::binary>> = rest
+            chunk
+
+          <<0x82, 126, len::big-16, rest::binary>> ->
+            <<chunk::binary-size(len), _::binary>> = rest
+            chunk
+
+          other ->
+            other
+        end
+
+      {framed, _} = Frame.read_frames(payload)
+
+      Enum.each(framed, fn ciphertext ->
+        case NoiseSocket.decrypt(state.ns, ciphertext) do
+          {:ok, plain, _ns2} ->
+            case unpack_and_decode(plain) do
+              {:ok, %Binary.Node{} = node} ->
+                Mix.shell().info("        decoded: #{inspect(node, limit: 16)}")
+
+                case node do
+                  %Binary.Node{tag: "stream:error"} ->
+                    code = Binary.Node.attr(node, "code")
+
+                    Mix.shell().info("""
+
+                            >>> server said <stream:error code=#{inspect(code)}>
+                            >>> code 515 = "stream replaced" — another session for this
+                            >>>   device is open server-side. Wait 30-60 s and retry.
+                            >>> code 401 = unauthorized (identity / payload rejected)
+                            >>> code 500 = client-outdated (WAVersion drift)
+                            >>> code 503 = rate-limited reconnect — back off and retry
+                    """)
+
+                  %Binary.Node{tag: "failure"} ->
+                    reason = Binary.Node.attr(node, "reason")
+                    code = Binary.Node.attr(node, "code")
+
+                    Mix.shell().info("""
+
+                            >>> server said <failure code=#{inspect(code)} reason=#{inspect(reason)}>
+                            >>> account may have been unlinked from the phone, or the
+                            >>>   ADV signature material got rotated. Re-pair from scratch.
+                    """)
+
+                  _ ->
+                    :ok
+                end
+
+              {:error, why} ->
+                Mix.shell().info("        binary-decode failed: #{inspect(why)}")
+            end
+
+          {:error, :auth_failed} ->
+            Mix.shell().info("        Noise auth_failed — counter or key drift")
+        end
+      end)
     end
   end
 

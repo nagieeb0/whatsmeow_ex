@@ -109,8 +109,6 @@ defmodule Whatsmeow.Media.Upload do
       })
 
     origin = Keyword.get(opts, :origin, "https://web.whatsapp.com")
-    host = List.first(conn.hosts)
-    url = "https://#{host}/#{prefix}/#{mms}/#{token}?#{query}"
 
     headers = [
       {"origin", origin},
@@ -118,24 +116,62 @@ defmodule Whatsmeow.Media.Upload do
       {"content-length", Integer.to_string(byte_size(body))}
     ]
 
+    path = "#{prefix}/#{mms}/#{token}?#{query}"
+
+    # WhatsApp returns several media hosts; a single host can transiently fail
+    # DNS/connect (`:nxdomain`/`:timeout`). Port whatsmeow's behaviour and try
+    # each host in turn instead of only `List.first`, but stop early on a
+    # definitive (non-transport) response — those repeat on every host.
+    post_to_hosts(
+      conn.hosts,
+      path,
+      headers,
+      body,
+      enc,
+      plaintext,
+      {:error, :media_conn_missing_hosts}
+    )
+  end
+
+  defp post_to_hosts([], _path, _headers, _body, _enc, _plaintext, last_err), do: last_err
+
+  defp post_to_hosts([host | rest], path, headers, body, enc, plaintext, _last) do
+    url = "https://#{host}/#{path}"
+
     case do_http_post(url, headers, body) do
       {:ok, parsed} ->
-        {:ok,
-         %{
-           url: parsed["url"] || "",
-           direct_path: parsed["direct_path"] || "",
-           handle: parsed["handle"],
-           object_id: parsed["object_id"],
-           media_key: enc.media_key,
-           file_sha256: :crypto.hash(:sha256, plaintext),
-           file_enc_sha256: enc.sha256_enc,
-           file_length: byte_size(plaintext)
-         }}
+        {:ok, build_result(parsed, enc, plaintext)}
 
-      {:error, _} = err ->
-        err
+      {:error, reason} = err ->
+        if transient?(reason) and rest != [] do
+          post_to_hosts(rest, path, headers, body, enc, plaintext, err)
+        else
+          err
+        end
     end
   end
+
+  defp build_result(parsed, enc, plaintext) do
+    %{
+      url: parsed["url"] || "",
+      direct_path: parsed["direct_path"] || "",
+      handle: parsed["handle"],
+      object_id: parsed["object_id"],
+      media_key: enc.media_key,
+      # Reuse the SHA-256 we already computed in `encrypt/2` — hashing the full
+      # plaintext twice on every upload was a measurable cost for 4MB+ media.
+      file_sha256: enc.sha256_plain,
+      file_enc_sha256: enc.sha256_enc,
+      file_length: byte_size(plaintext)
+    }
+  end
+
+  # Connection-level failures worth trying another host for; HTTP-status and
+  # decode errors are deterministic across hosts, so we surface them as-is.
+  defp transient?(%Mint.TransportError{}), do: true
+  defp transient?(%Finch.TransportError{}), do: true
+  defp transient?({:finch, _}), do: true
+  defp transient?(_), do: false
 
   defp do_http_post(url, headers, body) do
     finch_name = Application.get_env(:whatsmeow_ex, :finch_name, Whatsmeow.Finch)
