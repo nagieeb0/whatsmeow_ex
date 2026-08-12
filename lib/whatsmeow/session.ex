@@ -296,7 +296,7 @@ defmodule Whatsmeow.Session do
   @impl GenServer
   def init(opts) do
     device_id = Keyword.fetch!(opts, :device_id)
-    device = Keyword.get(opts, :device)
+    device = reload_device(device_id, Keyword.get(opts, :device))
     transport = Keyword.get(opts, :transport, Whatsmeow.Config.transport())
     transport_opts = Keyword.get(opts, :transport_opts, [])
     auto_reconnect? = Keyword.get(opts, :auto_reconnect?, true)
@@ -317,6 +317,73 @@ defmodule Whatsmeow.Session do
        keepalive_failures: 0,
        auto_reconnect?: auto_reconnect?
      }}
+  end
+
+  # Re-read the device from the store instead of trusting the one in `opts`.
+  #
+  # `Whatsmeow.start_session/2` bakes the `%Device{}` into the child spec it
+  # hands `DynamicSupervisor`, and a supervisor restarts a child from the spec
+  # it was ORIGINALLY given. So `opts[:device]` is a snapshot frozen at the
+  # moment the session was first started — which, for the case that matters, is
+  # *before* pairing.
+  #
+  # Pairing writes the adv credentials (`adv_account_sig`, the real JID, the
+  # identity/noise keys) to the store. It cannot write them back into a child
+  # spec the supervisor is holding. So the crash path was:
+  #
+  #   pair → credentials in Postgres, session authenticated
+  #   crash → supervisor restarts from the stale spec → unpaired device
+  #        → handshake has no login payload → server sends <pair-device>
+  #        → a QR appears and the user is asked to scan again
+  #
+  # while the store held a perfectly good paired device the whole time. That
+  # defeats the entire point of persisting the device, and it is silent: the
+  # logs show a normal connect, just into a pairing flow instead of a login.
+  #
+  # Observed downstream (imdent, 2026-08-12): killing a live, logged-in session
+  # left it emitting QR codes for 11+ minutes with `adv_account_sig` present in
+  # the row the whole time.
+  #
+  # Falls back to the passed struct when the store has nothing for this key —
+  # a brand-new device on its very first start, and any host using an in-memory
+  # or custom store that does not persist.
+  defp reload_device(device_id, fallback) do
+    with nil <- by_client_id(device_id),
+         nil <- by_jid(device_id) do
+      fallback
+    else
+      %Device{} = fresh ->
+        if fallback && Map.get(fallback, :jid) != Map.get(fresh, :jid) do
+          Logger.info(
+            "[whatsmeow] session restarted with a stale device snapshot; " <>
+              "reloaded from store (spec jid=#{inspect(Map.get(fallback, :jid))} " <>
+              "store jid=#{inspect(Map.get(fresh, :jid))})",
+            device_id: device_id
+          )
+        end
+
+        fresh
+    end
+  end
+
+  defp by_client_id(device_id) do
+    case Whatsmeow.Store.get_device_by_client_id(device_id) do
+      {:ok, %Device{} = d} -> d
+      _ -> nil
+    end
+  rescue
+    # A store that is not up yet must not stop the session from booting; the
+    # fallback snapshot still lets it run exactly as it did before.
+    _ -> nil
+  end
+
+  defp by_jid(device_id) do
+    case Whatsmeow.Store.get_device(device_id) do
+      {:ok, %Device{} = d} -> d
+      _ -> nil
+    end
+  rescue
+    _ -> nil
   end
 
   @impl GenServer

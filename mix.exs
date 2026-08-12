@@ -50,7 +50,13 @@ defmodule WhatsmeowEx.MixProject do
       {:mint, "~> 1.7"},
       {:mint_web_socket, "~> 1.0"},
       {:castore, "~> 1.0"},
-      {:finch, "~> 0.20"},
+      # 0.23, not 0.20: `Whatsmeow.Media.Upload.transient?/1` matches on
+      # `%Finch.TransportError{}`, which does not exist before 0.23 — Finch
+      # surfaced `%Mint.TransportError{}` directly until then. With `~> 0.20`
+      # a standalone `mix deps.get` resolves 0.21 and the library does not
+      # compile at all; it only ever built inside a host app whose lock
+      # happened to pin a new enough Finch.
+      {:finch, "~> 0.23"},
 
       # --- Protocol + state machines ---
       {:protobuf, "~> 0.13"},
