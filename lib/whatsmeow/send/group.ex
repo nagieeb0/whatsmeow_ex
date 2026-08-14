@@ -53,6 +53,7 @@ defmodule Whatsmeow.Send.Group do
   alias Whatsmeow.Binary.Node
   alias Whatsmeow.Send
   alias Whatsmeow.Session
+  alias Whatsmeow.Signal.Lock
   alias Whatsmeow.Signal.GroupDecrypt
   alias Whatsmeow.Signal.GroupSession
   alias Whatsmeow.Signal.SenderKeyWire
@@ -108,15 +109,26 @@ defmodule Whatsmeow.Send.Group do
     sender_id = JID.to_string(device.jid)
     sender_key_id = Keyword.get(opts, :registration_id, device.registration_id || 0)
 
-    {:ok, gs} = load_or_new_group_session(device.jid, group_id_str, sender_id, sender_key_id)
-
     body_plaintext = Send.build_e2e_text_message(text)
 
-    {body_envelope, gs2} = GroupDecrypt.encrypt_envelope(gs, body_plaintext)
+    # Load, encrypt, and store the sender key as one atomic step. The fanout
+    # below waits on prekey-bundle IQs, so leaving the store until after it (as
+    # this used to) left a multi-second window in which a second concurrent group
+    # send would load the same chain key and encrypt at the same iteration —
+    # repeating a message key, not merely losing an update. Persisting up front
+    # means a failed wire write costs one skipped iteration, which every group
+    # member's ratchet already knows how to absorb.
+    {body_envelope, gs2} =
+      Lock.with_sender_key(device.jid, group_id_str, sender_id, fn ->
+        {:ok, gs} = load_or_new_group_session(device.jid, group_id_str, sender_id, sender_key_id)
+        {envelope, advanced} = GroupDecrypt.encrypt_envelope(gs, body_plaintext)
+        _ = persist_group_session(device.jid, group_id_str, sender_id, advanced)
+        {envelope, advanced}
+      end)
 
     skdm_plaintext = build_skdm_plaintext(group_id_str, gs2)
 
-    with {:ok, participant_nodes, include_identity?, per_device_sessions} <-
+    with {:ok, participant_nodes, include_identity?} <-
            fanout_skdm(server, device, devices, skdm_plaintext, opts) do
       msg_id = Keyword.get_lazy(opts, :message_id, &Send.generate_message_id/0)
       phash = participant_list_hash_v2(devices)
@@ -133,8 +145,8 @@ defmodule Whatsmeow.Send.Group do
 
       case Session.send_node(server, node) do
         :ok ->
-          _ = persist_group_session(device.jid, group_id_str, sender_id, gs2)
-          _ = persist_per_device_sessions(device.jid, per_device_sessions)
+          # Both the sender key and the per-device 1:1 sessions are already
+          # stored, each inside the lock it was encrypted under.
           _ = Whatsmeow.Retry.RecentCache.put(group_id_str, msg_id, body_plaintext, "text")
           {:ok, msg_id}
 
@@ -178,7 +190,7 @@ defmodule Whatsmeow.Send.Group do
     # when zero devices encrypted — group sends to a moribund group
     # need the diagnostic. Hence the local `Task.async_stream` instead
     # of reusing `parallel_fanout/2`.
-    {nodes, sessions, errs, any_pkmsg?} =
+    {nodes, errs, any_pkmsg?} =
       devices
       |> Task.async_stream(
         fn ad_jid ->
@@ -189,28 +201,22 @@ defmodule Whatsmeow.Send.Group do
         timeout: Whatsmeow.Config.fanout_task_timeout_ms(),
         on_timeout: :kill_task
       )
-      |> Enum.reduce({[], [], [], false}, fn
-        {:ok, {%JID{} = ad_jid, {:ok, envelope, enc_type, new_sess}}},
-        {nodes_acc, sessions_acc, errs_acc, pkmsg?} ->
+      |> Enum.reduce({[], [], false}, fn
+        {:ok, {%JID{} = ad_jid, {:ok, envelope, enc_type, _new_sess}}},
+        {nodes_acc, errs_acc, pkmsg?} ->
           participant = build_participant_node(ad_jid, envelope, enc_type)
+          {[participant | nodes_acc], errs_acc, pkmsg? or enc_type == "pkmsg"}
 
-          {
-            [participant | nodes_acc],
-            [{ad_jid, new_sess} | sessions_acc],
-            errs_acc,
-            pkmsg? or enc_type == "pkmsg"
-          }
-
-        {:ok, {%JID{} = ad_jid, {:error, reason}}}, {nodes_acc, sessions_acc, errs_acc, pkmsg?} ->
+        {:ok, {%JID{} = ad_jid, {:error, reason}}}, {nodes_acc, errs_acc, pkmsg?} ->
           Logger.warning(
             "[whatsmeow] group fanout: skipped #{JID.to_string(ad_jid)}: #{inspect(reason)}"
           )
 
-          {nodes_acc, sessions_acc, [{ad_jid, reason} | errs_acc], pkmsg?}
+          {nodes_acc, [{ad_jid, reason} | errs_acc], pkmsg?}
 
-        {:exit, reason}, {nodes_acc, sessions_acc, errs_acc, pkmsg?} ->
+        {:exit, reason}, {nodes_acc, errs_acc, pkmsg?} ->
           Logger.warning("[whatsmeow] group fanout: task crashed: #{inspect(reason)}")
-          {nodes_acc, sessions_acc, [{:task_crashed, reason} | errs_acc], pkmsg?}
+          {nodes_acc, [{:task_crashed, reason} | errs_acc], pkmsg?}
       end)
 
     case {nodes, errs} do
@@ -221,7 +227,7 @@ defmodule Whatsmeow.Send.Group do
         {:error, :no_devices_resolved}
 
       _ ->
-        {:ok, Enum.reverse(nodes), any_pkmsg?, Enum.reverse(sessions)}
+        {:ok, Enum.reverse(nodes), any_pkmsg?}
     end
   end
 
@@ -323,36 +329,20 @@ defmodule Whatsmeow.Send.Group do
   # --- Persistence -----------------------------------------------------------
 
   defp load_or_new_group_session(our_jid, group_id_str, sender_id, sender_key_id) do
-    if repo_up?() do
-      case Whatsmeow.Signal.GroupSession.Store.Postgres.get(our_jid, group_id_str, sender_id) do
-        {:ok, %GroupSession{signing_priv: priv} = gs}
-        when is_binary(priv) and byte_size(priv) == 32 ->
-          {:ok, gs}
+    case Whatsmeow.Signal.Store.Adapter.load_sender_key(our_jid, group_id_str, sender_id) do
+      {:ok, %GroupSession{signing_priv: priv} = gs}
+      when is_binary(priv) and byte_size(priv) == 32 ->
+        {:ok, gs}
 
-        _ ->
-          {:ok, GroupSession.new(sender_key_id)}
-      end
-    else
-      {:ok, GroupSession.new(sender_key_id)}
+      # No stored key, or one from before signing keys were persisted — start a
+      # fresh chain rather than sending with a key we can't sign for.
+      _ ->
+        {:ok, GroupSession.new(sender_key_id)}
     end
   end
 
-  defp persist_group_session(our_jid, group_id_str, sender_id, %GroupSession{} = gs) do
-    if repo_up?(),
-      do: Whatsmeow.Signal.GroupSession.Store.Postgres.put(our_jid, group_id_str, sender_id, gs),
-      else: :ok
-  end
-
-  defp persist_per_device_sessions(our_jid, sessions) do
-    # Wrap the per-device upserts in a single transaction so N recipients
-    # cost one round-trip total, not N. `Send.persist_sessions_batch/2`
-    # already handles the no-Repo fallback.
-    Send.persist_sessions_batch(our_jid, sessions)
-  end
-
-  defp repo_up? do
-    Code.ensure_loaded?(Whatsmeow.Repo) and is_pid(Process.whereis(Whatsmeow.Repo))
-  end
+  defp persist_group_session(our_jid, group_id_str, sender_id, %GroupSession{} = gs),
+    do: Whatsmeow.Signal.Store.Adapter.save_sender_key(our_jid, group_id_str, sender_id, gs)
 
   # --- Helpers ---------------------------------------------------------------
 

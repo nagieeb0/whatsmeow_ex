@@ -112,6 +112,132 @@ end
 :ok = Whatsmeow.send_text(pid, "1234567890@s.whatsapp.net", "hello")
 ```
 
+## Sending
+
+One generic entry point; `Whatsmeow.Content` builds the payloads.
+
+```elixir
+# Text, media
+{:ok, id} = Whatsmeow.send_text(pid, peer, "hello")
+{:ok, id} = Whatsmeow.send_image(pid, peer, bytes, media_conn: conn, caption: "hi")
+{:ok, id} = Whatsmeow.send_sticker(pid, peer, webp_bytes, media_conn: conn)
+
+# Acting on a previous message
+{:ok, _} = Whatsmeow.send_reaction(pid, chat, sender, msg_id, "👍")
+{:ok, _} = Whatsmeow.send_edit(pid, chat, msg_id, "fixed typo")
+{:ok, _} = Whatsmeow.send_revoke(pid, chat, nil, msg_id)
+
+# Everything else — build a payload, then send it
+alias Whatsmeow.Content
+
+{:ok, _} = Whatsmeow.send_message(pid, peer, Content.location(30.0444, 31.2357, name: "Cairo"))
+{:ok, _} = Whatsmeow.send_message(pid, peer, Content.contact("Ahmed", Content.vcard("Ahmed", "201001234567")))
+{:ok, _} = Whatsmeow.send_message(pid, peer, Content.pin(chat, nil, msg_id, 604_800))
+
+# Other builders: link_preview/3, group_invite/5, unpin/3, keep/3, unkeep/3,
+# event/3, live_location/4, contacts/2, album/2
+
+# Voting needs the poll's secret, so it goes through the session
+{:ok, _} = Whatsmeow.send_poll_vote(pid, %{chat: chat, sender: sender, id: poll_id}, ["Yes"])
+
+# Composable wrappers — chain in any order
+Content.text("look")
+|> Content.reply(quoted_key, quoted)
+|> Content.mention([jid])
+|> Content.view_once()
+|> then(&Whatsmeow.send_message(pid, peer, &1))
+
+# Media can't be composed beforehand (the payload only exists after the upload),
+# so it gets the same treatment through :decorate
+Whatsmeow.send_image(pid, peer, bytes,
+  media_conn: conn,
+  decorate: &Content.reply(&1, quoted_key, quoted))
+```
+
+## Contacts and identity
+
+```elixir
+# Send to the JID this returns, not the number you typed — the server canonicalises.
+{:ok, [%{jid: jid, is_in?: true}]} = Whatsmeow.on_whatsapp(pid, ["201001234567"])
+
+{:ok, info} = Whatsmeow.fetch_status(pid, [jid])
+{:ok, [%{lid: lid, pn: pn}]} = Whatsmeow.resolve_lid(pid, [jid])
+
+# LID ↔ PN, from the local cache only
+Whatsmeow.LIDMap.pn_for("123456789@lid")
+Whatsmeow.LIDMap.resolve(some_jid)
+```
+
+## Plugins
+
+Middleware on both directions, applied to every path:
+
+```elixir
+Whatsmeow.Plugin.attach(:send, :blocklist, fn ctx ->
+  if ctx.to.user in banned(), do: {:halt, :blocked}, else: {:cont, ctx}
+end)
+
+Whatsmeow.Plugin.attach(:recv, :drop_spam, fn ctx ->
+  if spam?(ctx.message.body), do: {:halt, :spam}, else: {:cont, ctx}
+end)
+```
+
+A halted send returns `{:error, {:halted, reason}}`; a halted receive is never broadcast.
+
+## Testing your bot
+
+`Whatsmeow.Testing` gives you a real session that never opens a socket:
+
+```elixir
+{:ok, session} = Whatsmeow.Testing.start_offline()
+{:ok, _bot}    = MyBot.start_link(session)
+
+Whatsmeow.Testing.deliver_text(session, from: "15551234567@s.whatsapp.net", text: "ping")
+
+assert [%{message: %{conversation: "pong"}}] = Whatsmeow.Testing.sent(session)
+```
+
+No database, no QR, no network. Your receive→reply path runs unchanged.
+
+## Declarative supervision
+
+For a fixed set of accounts known at boot:
+
+```elixir
+children = [
+  MyApp.WhatsAppRouter,
+  {Whatsmeow, client_id: "sales"},
+  {Whatsmeow, client_id: "support"}
+]
+```
+
+The device is loaded from the store at start, so a restart after pairing doesn't ask for a new QR.
+
+## Running without Postgres
+
+The Signal layer can go to disk instead:
+
+```elixir
+config :whatsmeow_ex, signal_store: Whatsmeow.Signal.Store.DETS
+config :whatsmeow_ex, signal_store_dir: "./whatsmeow_data"
+```
+
+Covers everything the Signal layer needs — sessions, sender keys, peer identity keys, and one-time prekeys — so an account can pair and decrypt with no database.
+
+Single-node only, and **without a Repo the session lock is a no-op**, so send and receive can still interleave on the same record within one node. Fine for a quiet bot; use Postgres for anything busy. Device records, app-state, contacts, and chat settings still require the Repo either way.
+
+## Things that fail silently without them
+
+Three protocol details where "it looked like it worked" is the failure mode:
+
+| | What breaks without it | Where |
+|---|---|---|
+| **tctoken** | Send is acked, message never delivered (error 463) | `Whatsmeow.PrivacyToken` |
+| **History sync** | Chat list stays empty; phone shows the device as Paused | `Whatsmeow.HistorySync` |
+| **Session lock** | Concurrent send/receive clobber the Signal session; chats stick on "Waiting for this message" | `Whatsmeow.Signal.Lock` |
+
+A rejected send is surfaced as `%Whatsmeow.Types.Events.SendRejected{}` — subscribe to it, since `send_text/4` has already returned `{:ok, id}` by the time the ack lands.
+
 ## What's locked-by-tests
 
 The cryptographically critical paths are covered against RFC test vectors or property tests:

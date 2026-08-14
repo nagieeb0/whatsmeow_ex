@@ -168,4 +168,70 @@ defmodule Whatsmeow.Types.Events do
     defstruct [:device_id, :user]
     @type t :: %__MODULE__{device_id: String.t(), user: User.t()}
   end
+
+  defmodule HistorySync do
+    @moduledoc """
+    A chunk of your existing chat history, downloaded and decoded.
+
+    Arrives after linking (and incrementally afterwards) as your phone uploads
+    the chats this device was never online for. `sync` is the decoded
+    `%WAWebProtobufsHistorySync.HistorySync{}`: `conversations` holds the chats
+    and their messages, `statusV3Messages` the status/story posts.
+
+    History arrives in **chunks** — `progress` counts toward 100 and
+    `chunk_order` orders them. Expect several of these events per link, not one.
+
+    This is the only way to recover a message the live path never delivered —
+    most notably one you sent from your phone while this device was offline,
+    which WhatsApp does not redeliver on reconnect.
+    """
+    defstruct [:device_id, :sync, :sync_type, :progress, :chunk_order]
+
+    @type t :: %__MODULE__{
+            device_id: String.t(),
+            sync: struct(),
+            sync_type: atom() | nil,
+            progress: non_neg_integer() | nil,
+            chunk_order: non_neg_integer() | nil
+          }
+  end
+
+  defmodule HistorySyncFailed do
+    @moduledoc """
+    A history-sync blob was announced but could not be retrieved.
+
+    Emitted instead of `HistorySync` when the download, inflate, or decode step
+    fails, so a silent gap in the chat list is visible rather than mysterious.
+    """
+    defstruct [:device_id, :reason, :notification]
+
+    @type t :: %__MODULE__{device_id: String.t(), reason: term(), notification: struct() | nil}
+  end
+
+  defmodule SendRejected do
+    @moduledoc """
+    The server accepted an outbound stanza on the socket but the application
+    layer rejected it — the message was **not** delivered.
+
+    Arrives as `<ack class="message" error="…">`. Without this event a rejected
+    send is indistinguishable from a successful one: `Whatsmeow.Send.send_text/4`
+    already returned `{:ok, msg_id}` by the time the ack lands.
+
+    Codes worth knowing:
+
+      * `"463"` — account restriction; we sent without a trusted-contact token
+        the recipient trusts. See `Whatsmeow.PrivacyToken`.
+      * `"479"` — the stanza failed the server's schema validation.
+      * `"401"` / `"403"` — not authorised to message this recipient.
+    """
+    defstruct [:device_id, :message_id, :code, :from, :class]
+
+    @type t :: %__MODULE__{
+            device_id: String.t(),
+            message_id: String.t() | nil,
+            code: String.t(),
+            from: JID.t() | nil,
+            class: String.t() | nil
+          }
+  end
 end

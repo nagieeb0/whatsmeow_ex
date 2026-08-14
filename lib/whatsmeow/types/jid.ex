@@ -221,6 +221,27 @@ defmodule Whatsmeow.Types.JID do
     end
   end
 
+  @doc """
+  True for WhatsApp's own bot accounts (Meta AI and friends).
+
+  Mirrors Go's `JID.IsBot` (`whatsmeow-main/types/jid.go:127`): either the
+  dedicated `@bot` server, or one of the reserved phone-number ranges on the
+  normal user server with no device suffix.
+  """
+  @spec bot?(t()) :: boolean()
+  def bot?(%__MODULE__{server: @bot_server}), do: true
+
+  def bot?(%__MODULE__{server: @default_user_server, user: user, device: device})
+      when device in [0, nil] do
+    Regex.match?(~r/^1313555\d{4}$|^131655500\d{2}$/, user)
+  end
+
+  def bot?(%__MODULE__{}), do: false
+
+  @doc "The public-service-announcement JID (`0@s.whatsapp.net`)."
+  @spec psa_user() :: String.t()
+  def psa_user, do: "0"
+
   @doc "Return the domain-type byte that whatsmeow uses for the Noise client payload."
   @spec actual_agent(t()) :: 0 | 1 | 128 | 129 | non_neg_integer()
   def actual_agent(%__MODULE__{server: @default_user_server}), do: 0

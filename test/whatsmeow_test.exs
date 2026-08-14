@@ -71,10 +71,36 @@ defmodule WhatsmeowTest do
     end
   end
 
-  describe "placeholders" do
-    test "send_text/3 raises NotImplementedError pointing at Phase 9" do
-      assert_raise Whatsmeow.NotImplementedError, ~r/Phase 9/, fn ->
-        Whatsmeow.send_text(self(), "x@s.whatsapp.net", "hi")
+  describe "send facade" do
+    # These used to raise NotImplementedError. They now delegate to
+    # `Whatsmeow.Send`, so what is worth pinning is that the delegation exists
+    # and that a bad JID is rejected before anything reaches a session.
+    test "every send entry point is reachable from the facade" do
+      # function_exported?/3 answers false for a module that isn't loaded yet,
+      # which in a lazily-loading test run is a false negative, not a finding.
+      Code.ensure_loaded!(Whatsmeow)
+
+      for {fun, arity} <- [
+            send_text: 4,
+            send_message: 4,
+            send_image: 4,
+            send_video: 4,
+            send_audio: 4,
+            send_voice: 4,
+            send_document: 4,
+            send_sticker: 4,
+            send_reaction: 6,
+            send_revoke: 5,
+            send_edit: 5,
+            send_poll_vote: 4,
+            on_whatsapp: 3,
+            fetch_status: 3,
+            resolve_lid: 3,
+            get_user_devices: 3,
+            child_spec: 1
+          ] do
+        assert function_exported?(Whatsmeow, fun, arity),
+               "Whatsmeow.#{fun}/#{arity} is not exported"
       end
     end
   end

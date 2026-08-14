@@ -814,7 +814,7 @@ defmodule Mix.Tasks.Whatsmeow.Smoke do
             state
         end
 
-      {:error, :no_repo} ->
+      {:error, reason} when reason in [:no_repo, :no_store] ->
         Mix.shell().info(
           "      · skipping prekey upload — Postgres not reachable. " <>
             "Pre-key bundles only matter for peer-first-contact; this won't " <>

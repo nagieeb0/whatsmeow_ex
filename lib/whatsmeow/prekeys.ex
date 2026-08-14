@@ -46,6 +46,7 @@ defmodule Whatsmeow.PreKeys do
   alias Whatsmeow.Crypto.Curve25519
   alias Whatsmeow.IQ
   alias Whatsmeow.Session
+  alias Whatsmeow.Signal.Store.Adapter
   alias Whatsmeow.Store.Schemas.{Device, PreKey}
 
   @server_jid "s.whatsapp.net"
@@ -176,18 +177,101 @@ defmodule Whatsmeow.PreKeys do
   persists fresh ones if the pool falls short.
 
   Returns `{:ok, [%{key_id, priv, pub}]}` on success or
-  `{:error, :no_repo}` when Postgres isn't reachable (tests).
+  `{:error, :no_store}` when no Signal store is reachable (tests).
   """
   @spec get_or_generate(String.t(), pos_integer()) ::
-          {:ok, [prekey()]} | {:error, :no_repo | term()}
+          {:ok, [prekey()]} | {:error, :no_store | term()}
   def get_or_generate(our_jid, count) when is_binary(our_jid) and count > 0 do
-    if repo_up?() do
-      do_get_or_generate(our_jid, count)
-    else
-      {:error, :no_repo}
+    cond do
+      not Adapter.available?() ->
+        {:error, :no_store}
+
+      # Postgres keeps the ordered-query fast path it always had.
+      Adapter.impl() == Whatsmeow.Signal.Store.Postgres ->
+        do_get_or_generate(our_jid, count)
+
+      true ->
+        do_get_or_generate_via_adapter(our_jid, count)
     end
   rescue
-    e -> {:error, {:repo, Exception.message(e)}}
+    e -> {:error, {:store, Exception.message(e)}}
+  end
+
+  # Adapter-neutral version of `do_get_or_generate/2`: same top-up logic
+  # expressed with the four primitives every store provides, so an account can
+  # pair and decrypt with no database at all.
+  defp do_get_or_generate_via_adapter(our_jid, count) do
+    existing = Adapter.load_unuploaded_prekeys(our_jid, count)
+    needed = count - length(existing)
+
+    fresh =
+      if needed > 0 do
+        keys = generate(needed, Adapter.max_prekey_id(our_jid) + 1)
+        _ = Adapter.save_prekeys(our_jid, keys)
+        keys
+      else
+        []
+      end
+
+    {:ok, Enum.take(existing ++ fresh, count)}
+  end
+
+  @doc """
+  Up to `count` prekeys not yet uploaded, lowest id first.
+
+  Split out of `get_or_generate/2` so `Whatsmeow.Signal.Store.Adapter` has a
+  Postgres implementation of the same four primitives every adapter provides.
+  """
+  @spec unuploaded(String.t(), pos_integer()) :: [prekey()]
+  def unuploaded(our_jid, count) do
+    import Ecto.Query
+
+    from(p in PreKey,
+      where: p.jid == ^our_jid and p.uploaded == false,
+      order_by: p.key_id,
+      limit: ^count
+    )
+    |> Whatsmeow.Repo.all()
+    |> Enum.map(fn %PreKey{key_id: id, key: priv} ->
+      %{key_id: id, priv: priv, pub: Whatsmeow.Crypto.Curve25519.public_for(priv)}
+    end)
+  rescue
+    _ -> []
+  end
+
+  @doc "The highest prekey id stored for `our_jid`, or 0 when there are none."
+  @spec max_id(String.t()) :: non_neg_integer()
+  def max_id(our_jid) do
+    import Ecto.Query
+
+    from(p in PreKey, where: p.jid == ^our_jid, select: max(p.key_id))
+    |> Whatsmeow.Repo.one()
+    |> case do
+      n when is_integer(n) -> n
+      _ -> 0
+    end
+  rescue
+    _ -> 0
+  end
+
+  @doc "One prekey's private half by id, or `nil`."
+  @spec get_private(String.t(), non_neg_integer()) :: binary() | nil
+  def get_private(our_jid, key_id) do
+    case Whatsmeow.Repo.get_by(PreKey, jid: our_jid, key_id: key_id) do
+      %PreKey{key: priv} when is_binary(priv) and byte_size(priv) == 32 -> priv
+      _ -> nil
+    end
+  rescue
+    _ -> nil
+  end
+
+  @doc "Bulk-store generated prekeys as not-yet-uploaded."
+  @spec persist_bulk(String.t(), [prekey()]) :: :ok
+  def persist_bulk(our_jid, keys) when is_list(keys) do
+    persist_prekeys_bulk(our_jid, keys)
+    :ok
+  rescue
+    _ -> :ok
   end
 
   defp do_get_or_generate(our_jid, count) do
@@ -263,19 +347,24 @@ defmodule Whatsmeow.PreKeys do
   @spec mark_uploaded(String.t(), non_neg_integer()) :: {:ok, integer()} | {:error, term()}
   def mark_uploaded(our_jid, max_key_id)
       when is_binary(our_jid) and is_integer(max_key_id) and max_key_id > 0 do
-    if repo_up?() do
-      import Ecto.Query
+    cond do
+      not Adapter.available?() ->
+        {:error, :no_store}
 
-      {n, _} =
-        from(p in PreKey, where: p.jid == ^our_jid and p.key_id <= ^max_key_id)
-        |> Whatsmeow.Repo.update_all(set: [uploaded: true])
+      Adapter.impl() == Whatsmeow.Signal.Store.Postgres ->
+        import Ecto.Query
 
-      {:ok, n}
-    else
-      {:error, :no_repo}
+        {n, _} =
+          from(p in PreKey, where: p.jid == ^our_jid and p.key_id <= ^max_key_id)
+          |> Whatsmeow.Repo.update_all(set: [uploaded: true])
+
+        {:ok, n}
+
+      true ->
+        Adapter.mark_prekeys_uploaded(our_jid, max_key_id)
     end
   rescue
-    e -> {:error, {:repo, Exception.message(e)}}
+    e -> {:error, {:store, Exception.message(e)}}
   end
 
   # ---------------------------------------------------------------------
@@ -316,9 +405,5 @@ defmodule Whatsmeow.PreKeys do
           err
       end
     end
-  end
-
-  defp repo_up? do
-    Code.ensure_loaded?(Whatsmeow.Repo) and is_pid(Process.whereis(Whatsmeow.Repo))
   end
 end

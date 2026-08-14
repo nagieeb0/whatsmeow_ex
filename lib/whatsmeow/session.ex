@@ -111,6 +111,12 @@ defmodule Whatsmeow.Session do
     # pairing is mid-flight, between the companion_hello and the inbound
     # link_code_companion_reg notification. nil at all other times.
     :pair_code,
+    # Offline/sandbox mode: no socket is ever opened and outbound messages are
+    # recorded here instead of encrypted and sent. Exists so a consumer can test
+    # their bot's receive→reply path without a WhatsApp connection — see
+    # `Whatsmeow.Testing`. Always false in normal operation.
+    offline?: false,
+    sent: [],
     pending: %{}
   ]
 
@@ -226,6 +232,38 @@ defmodule Whatsmeow.Session do
   def get_device(server), do: GenServer.call(via_or_pid(server), :get_device)
 
   @doc """
+  True when this session is in offline/sandbox mode — no socket, sends recorded
+  rather than transmitted. See `Whatsmeow.Testing`.
+  """
+  @spec offline?(pid() | String.t()) :: boolean()
+  def offline?(server), do: GenServer.call(via_or_pid(server), :offline?)
+
+  @doc """
+  Record `message` and return `:recorded` when this session is in sandbox mode,
+  or `:live` when it is a real session and the caller should go on and send it.
+
+  One call rather than an `offline?/1` check followed by a record — the send path
+  runs this on every message.
+  """
+  @spec record_if_offline(pid() | String.t(), term(), term(), String.t()) :: :recorded | :live
+  def record_if_offline(server, peer, message, msg_id) do
+    GenServer.call(via_or_pid(server), {:record_if_offline, peer, message, msg_id})
+  end
+
+  @doc """
+  Messages this offline session was asked to send, oldest first.
+
+  Each entry is `%{to: peer_jid, message: %WAWebProtobufsE2E.Message{}, id: msg_id}`.
+  Always empty for a normal session.
+  """
+  @spec sent_messages(pid() | String.t()) :: [map()]
+  def sent_messages(server), do: GenServer.call(via_or_pid(server), :sent_messages)
+
+  @doc "Drop the recorded outbound messages of an offline session."
+  @spec clear_sent(pid() | String.t()) :: :ok
+  def clear_sent(server), do: GenServer.call(via_or_pid(server), :clear_sent)
+
+  @doc """
   Begin phone-number ("link with phone number") pairing.
 
   Sends the `companion_hello` IQ for `phone` (international format; non-digit
@@ -300,6 +338,7 @@ defmodule Whatsmeow.Session do
     transport = Keyword.get(opts, :transport, Whatsmeow.Config.transport())
     transport_opts = Keyword.get(opts, :transport_opts, [])
     auto_reconnect? = Keyword.get(opts, :auto_reconnect?, true)
+    offline? = Keyword.get(opts, :offline?, false)
 
     Process.flag(:trap_exit, true)
 
@@ -315,7 +354,8 @@ defmodule Whatsmeow.Session do
        status: :idle,
        reconnect_attempts: 0,
        keepalive_failures: 0,
-       auto_reconnect?: auto_reconnect?
+       auto_reconnect?: auto_reconnect?,
+       offline?: offline?
      }}
   end
 
@@ -416,6 +456,27 @@ defmodule Whatsmeow.Session do
 
   def handle_call(:get_device, _from, %__MODULE__{device: device} = state) do
     {:reply, {:ok, device}, state}
+  end
+
+  def handle_call(:offline?, _from, %__MODULE__{offline?: offline?} = state) do
+    {:reply, offline?, state}
+  end
+
+  def handle_call({:record_if_offline, _peer, _message, _msg_id}, _from, %{offline?: false} = state) do
+    {:reply, :live, state}
+  end
+
+  def handle_call({:record_if_offline, peer, message, msg_id}, _from, state) do
+    entry = %{to: peer, message: message, id: msg_id}
+    {:reply, :recorded, %{state | sent: [entry | state.sent]}}
+  end
+
+  def handle_call(:sent_messages, _from, state) do
+    {:reply, Enum.reverse(state.sent), state}
+  end
+
+  def handle_call(:clear_sent, _from, state) do
+    {:reply, :ok, %{state | sent: []}}
   end
 
   def handle_call({:set_pair_code, hello}, _from, state) do
@@ -673,6 +734,17 @@ defmodule Whatsmeow.Session do
 
   def handle_info(:emit_next_qr, state), do: {:noreply, state}
 
+  def handle_info({:send_hist_sync_receipt, message_id}, state) do
+    case build_history_sync_receipt(state, message_id) do
+      nil ->
+        {:noreply, state}
+
+      node ->
+        {:ok, state2} = do_send_node(state, node) |> ok_or_keep(state)
+        {:noreply, state2}
+    end
+  end
+
   def handle_info({:EXIT, _, _reason}, state), do: {:noreply, state}
 
   def handle_info(:retry_count_sweep, state) do
@@ -896,12 +968,46 @@ defmodule Whatsmeow.Session do
         # arrives at the chatbot as an anonymous LID and the agent has to
         # ask "who are you?" even when we already know them by phone.
         _ = maybe_persist_lid_map(node)
+        _ = maybe_persist_privacy_token(state, node)
         state
       end
 
     ack = Whatsmeow.Receipt.build_ack(node)
     {:ok, state2} = do_send_node(state, ack) |> ok_or_keep(state)
     state2
+  end
+
+  # `<ack>` is the server's word on a stanza we sent. A bare ack is routine and
+  # ignorable; an ack carrying `error=` means the socket took the frame but the
+  # application layer threw it away — the send "succeeded" and the message was
+  # never delivered. That is the single most confusing failure in this protocol,
+  # so it gets its own event rather than a debug log.
+  defp dispatch_node(state, %Binary.Node{tag: "ack", attrs: attrs} = node) do
+    case Map.get(attrs, "error") do
+      nil ->
+        state
+
+      code ->
+        code = to_string(code)
+
+        Logger.warning(
+          "[whatsmeow] send rejected: ack error=#{code} id=#{inspect(Map.get(attrs, "id"))} " <>
+            "class=#{inspect(Map.get(attrs, "class"))}",
+          device_id: state.device_id
+        )
+
+        _ = maybe_reissue_privacy_token(state, node, code)
+
+        Whatsmeow.Notifications.broadcast(state.device_id, %Events.SendRejected{
+          device_id: state.device_id,
+          message_id: Map.get(attrs, "id"),
+          code: code,
+          from: Binary.Node.attr(node, "from"),
+          class: Map.get(attrs, "class")
+        })
+
+        state
+    end
   end
 
   defp dispatch_node(state, %Binary.Node{tag: "call"} = node) do
@@ -1058,37 +1164,22 @@ defmodule Whatsmeow.Session do
       {:ok, %{plaintext: plain}} ->
         case Whatsmeow.Signal.MessageBuilder.from_plaintext(plain, info) do
           {:ok, typed_msg, attachments} ->
-            # Sync — see comment in receipt branch above. Per-chat
-            # ordering at the subscriber depends on these being sent
-            # FROM THE SAME PID (the session GenServer). Task-spawn
-            # broadcasts shatter that guarantee.
-            Whatsmeow.Notifications.broadcast(state.device_id, %Events.Message{
-              device_id: state.device_id,
-              message: typed_msg,
-              info: info
-            })
+            # Protocol bookkeeping runs BEFORE the pipeline and regardless of it.
+            # A recv plugin decides what the *consumer* sees; it has no business
+            # deciding whether we download our own chat history or keep the key
+            # that later decrypts votes on a poll. Dropping a spam message must
+            # not silently break history sync.
+            _ = maybe_start_history_sync(state, typed_msg, info)
+            _ = maybe_store_message_secret(state, typed_msg, info)
 
-            Enum.each(attachments, fn descriptor ->
-              Whatsmeow.Notifications.broadcast(state.device_id, %Events.MediaMessage{
-                device_id: state.device_id,
-                info: info,
-                message: typed_msg,
-                descriptor: descriptor,
-                kind: descriptor.kind
-              })
-            end)
-
-            :telemetry.execute(
-              [:whatsmeow, :session, :message_decrypted],
-              %{system_time: System.system_time(), plaintext_bytes: byte_size(plain)},
-              %{
-                device_id: state.device_id,
-                from: info.from,
-                attachments: length(attachments)
-              }
-            )
-
-            :ok
+            # The receive pipeline runs before anything is broadcast, so a step
+            # that halts means no subscriber ever learns the message existed.
+            # It does NOT skip the ack — the server has already been told we got
+            # this message, and must be, or it redelivers forever.
+            case run_recv_pipeline(state, typed_msg, info) do
+              {:halt, _reason} -> :ok
+              {:ok, final} -> broadcast_decrypted(state, final, info, attachments, plain)
+            end
 
           {:error, reason} ->
             Logger.warning("[whatsmeow] WaE2E.Message decode failed",
@@ -1112,6 +1203,57 @@ defmodule Whatsmeow.Session do
     end
   end
 
+  defp run_recv_pipeline(state, typed_msg, info) do
+    ctx = %{from: info.from, message: typed_msg, info: info, device_id: state.device_id}
+
+    case Whatsmeow.Plugin.run(:recv, ctx) do
+      {:ok, %{message: %Whatsmeow.Types.Message{} = message}} ->
+        {:ok, message}
+
+      # A step handed back a ctx with no usable `:message`. Carry on with the
+      # original rather than crashing the session — this runs in the receive
+      # loop, and a plugin bug must not take the connection down with it.
+      {:ok, _} ->
+        {:ok, typed_msg}
+
+      {:halt, reason} ->
+        {:halt, reason}
+    end
+  end
+
+  defp broadcast_decrypted(state, typed_msg, info, attachments, plain) do
+    # Sync — see comment in receipt branch above. Per-chat ordering at the
+    # subscriber depends on these being sent FROM THE SAME PID (the session
+    # GenServer). Task-spawn broadcasts shatter that guarantee.
+    Whatsmeow.Notifications.broadcast(state.device_id, %Events.Message{
+      device_id: state.device_id,
+      message: typed_msg,
+      info: info
+    })
+
+    Enum.each(attachments, fn descriptor ->
+      Whatsmeow.Notifications.broadcast(state.device_id, %Events.MediaMessage{
+        device_id: state.device_id,
+        info: info,
+        message: typed_msg,
+        descriptor: descriptor,
+        kind: descriptor.kind
+      })
+    end)
+
+    :telemetry.execute(
+      [:whatsmeow, :session, :message_decrypted],
+      %{system_time: System.system_time(), plaintext_bytes: byte_size(plain)},
+      %{
+        device_id: state.device_id,
+        from: info.from,
+        attachments: length(attachments)
+      }
+    )
+
+    :ok
+  end
+
   # Snarf any LID ↔ phone pairings out of a `<notification>` and
   # persist them to `whatsmeow_lid_map`. WhatsApp announces these
   # pairings whenever a peer adds / removes a linked device or our
@@ -1133,6 +1275,13 @@ defmodule Whatsmeow.Session do
 
         # Top-level pairing (the peer's primary phone ↔ primary LID).
         _ = persist_lid_pn(lid, from)
+
+        # This notification IS the "their devices changed" signal. Drop the
+        # cached list now instead of waiting out its TTL — otherwise we keep
+        # encrypting to a device they removed, and a device they just added
+        # sees nothing for up to an hour.
+        _ = Whatsmeow.User.DeviceCache.invalidate(from)
+        _ = Whatsmeow.User.DeviceCache.invalidate(lid)
 
         # Per-device pairings inside `<add>` / `<remove>` / `<update>`.
         node
@@ -1159,20 +1308,23 @@ defmodule Whatsmeow.Session do
 
   defp maybe_persist_lid_map(_), do: :ok
 
-  defp persist_lid_pn(lid, pn) when is_binary(lid) and is_binary(pn) and lid != "" and pn != "" do
-    repo = Whatsmeow.Repo
+  # `<notification type="privacy_token">` carries the trusted-contact token the
+  # server issued for a peer. Persisting it is what lets the *next* 1:1 send
+  # attach a `<tctoken>` and avoid a silent 463 rejection. Without this write the
+  # table stays empty forever and `Whatsmeow.PrivacyToken.fetch/2` never hits.
+  defp maybe_persist_privacy_token(state, %Binary.Node{attrs: %{"type" => "privacy_token"}} = node) do
+    our_jid = own_jid_string(state)
 
-    if Code.ensure_loaded?(repo) and is_pid(Process.whereis(repo)) do
-      # Upsert; conflict-target is the LID column. `pn` is pinned via
-      # parameter — no string interpolation, so the Iron Law lint flag
-      # is a false positive (this is transport-layer code).
-      _ =
-        Ecto.Adapters.SQL.query(
-          repo,
-          "INSERT INTO whatsmeow_lid_map (lid, pn) VALUES ($1, $2) " <>
-            "ON CONFLICT (lid) DO UPDATE SET pn = EXCLUDED.pn",
-          [lid, pn]
-        )
+    if our_jid do
+      node
+      |> Whatsmeow.Notification.from_node()
+      |> Enum.each(fn
+        %Whatsmeow.Notification.PrivacyToken{} = ev ->
+          _ = Whatsmeow.PrivacyToken.store_notification(our_jid, ev)
+
+        _ ->
+          :ok
+      end)
     end
 
     :ok
@@ -1180,7 +1332,188 @@ defmodule Whatsmeow.Session do
     _ -> :ok
   end
 
-  defp persist_lid_pn(_, _), do: :ok
+  defp maybe_persist_privacy_token(_state, _node), do: :ok
+
+  # 463 = MessageAccountRestriction: we sent to a contact without a token they
+  # trust. Ask the server to issue one so the *next* send lands. We deliberately
+  # do not retry the rejected message — Baileys' `handleBadAck` notes that
+  # retrying a 463 compounds the restriction.
+  defp maybe_reissue_privacy_token(state, %Binary.Node{} = node, "463") do
+    our_jid = own_jid_string(state)
+    peer = Binary.Node.attr(node, "from")
+
+    with true <- is_binary(our_jid),
+         %Whatsmeow.Types.JID{} = peer_jid <- normalize_jid(peer) do
+      # Runs in a Task so the IQ round-trip doesn't stall the receive loop it's
+      # called from. `reissue_after_rejection/3` owns the debounce — a peer that
+      # rejects a burst of messages must not produce one IQ per rejection.
+      device_id = state.device_id
+
+      Task.start(fn ->
+        Whatsmeow.PrivacyToken.reissue_after_rejection(device_id, our_jid, peer_jid)
+      end)
+    end
+
+    :ok
+  rescue
+    _ -> :ok
+  end
+
+  defp maybe_reissue_privacy_token(_state, _node, _code), do: :ok
+
+  # --- History sync ---------------------------------------------------------
+
+  # Your phone announces the chat-history blob with a `historySyncNotification`
+  # inside a `protocolMessage`. Ignoring it (which is what we did before) leaves
+  # the chat list permanently empty and the phone showing this device as
+  # "Paused" — the live receive path only ever sees messages sent after linking.
+  defp maybe_start_history_sync(state, %{raw: raw}, info) do
+    # A history-sync notification is our own phone handing us our own chats. It
+    # can only come from us. Go gates the whole protocol-message handler on
+    # `info.IsFromMe` for this reason — without the check, any peer could point
+    # us at an arbitrary CDN blob and have us download and decrypt it.
+    with true <- info.is_from_me?,
+         %WAWebProtobufsE2E.HistorySyncNotification{} = notif <- history_sync_notification(raw) do
+      device_id = state.device_id
+      our_jid = own_jid_string(state)
+
+      Logger.info(
+        "[whatsmeow] history sync announced: type=#{inspect(notif.syncType)} " <>
+          "chunk=#{inspect(notif.chunkOrder)} progress=#{inspect(notif.progress)}",
+        device_id: device_id
+      )
+
+      # The phone waits for this before it will move past "Paused" and sends the
+      # next chunk. Acknowledges the notification, not the blob, so it goes out
+      # whether or not the download succeeds — withholding it stalls the sync.
+      #
+      # Sent as a self-message rather than inline: writing a frame advances the
+      # Noise cipher, and that advanced state has to be threaded back into the
+      # GenServer. We are three calls deep in a path that returns `:ok`, with no
+      # way to hand state back — dropping it would desynchronise the cipher and
+      # break every frame after this one.
+      send(self(), {:send_hist_sync_receipt, info.id})
+
+      # Background: the blob can be tens of megabytes, and the media-conn IQ it
+      # needs would deadlock if we called back into this process from here.
+      Task.start(fn -> run_history_sync(device_id, our_jid, notif) end)
+    end
+
+    :ok
+  rescue
+    _ -> :ok
+  end
+
+  defp maybe_start_history_sync(_state, _msg, _info), do: :ok
+
+  # `<receipt type="hist_sync" to="<our own jid>" id="<message id>"/>`.
+  # Ports Go's `SendProtocolMessageReceipt` (`whatsmeow-main/message.go:853`).
+  defp build_history_sync_receipt(state, message_id) when is_binary(message_id) do
+    case own_jid(state.device) do
+      %Whatsmeow.Types.JID{} = own ->
+        Binary.Node.new(
+          "receipt",
+          %{
+            "id" => message_id,
+            "type" => "hist_sync",
+            "to" => Whatsmeow.Types.JID.to_non_ad(own)
+          },
+          nil
+        )
+
+      _ ->
+        nil
+    end
+  end
+
+  defp build_history_sync_receipt(_state, _message_id), do: nil
+
+  defp history_sync_notification(%WAWebProtobufsE2E.Message{
+         protocolMessage: %WAWebProtobufsE2E.ProtocolMessage{
+           historySyncNotification: %WAWebProtobufsE2E.HistorySyncNotification{} = notif
+         }
+       }),
+       do: notif
+
+  defp history_sync_notification(_), do: nil
+
+  # --- Message secrets ------------------------------------------------------
+
+  defp maybe_store_message_secret(state, %{raw: raw}, info) do
+    with our_jid when is_binary(our_jid) <- own_jid_string(state),
+         secret when is_binary(secret) and byte_size(secret) > 0 <- message_secret(raw) do
+      chat = info.from && Whatsmeow.Types.JID.to_string(info.from)
+
+      sender =
+        cond do
+          info.is_from_me? -> our_jid
+          info.participant -> Whatsmeow.Types.JID.to_string(info.participant)
+          true -> chat
+        end
+
+      Whatsmeow.MsgSecret.Store.put(our_jid, chat, sender, info.id, secret)
+    else
+      _ -> :ok
+    end
+  rescue
+    _ -> :ok
+  end
+
+  defp maybe_store_message_secret(_state, _msg, _info), do: :ok
+
+  defp message_secret(%WAWebProtobufsE2E.Message{
+         messageContextInfo: %WAWebProtobufsE2E.MessageContextInfo{messageSecret: secret}
+       }),
+       do: secret
+
+  defp message_secret(_), do: nil
+
+  defp run_history_sync(device_id, our_jid, notif) do
+    case Whatsmeow.HistorySync.download(notif, server: device_id) do
+      {:ok, sync} ->
+        Whatsmeow.Notifications.broadcast(device_id, %Events.HistorySync{
+          device_id: device_id,
+          sync: sync,
+          sync_type: notif.syncType,
+          progress: sync.progress || notif.progress,
+          chunk_order: sync.chunkOrder || notif.chunkOrder
+        })
+
+        # After the consumer has the data — storing is best-effort and must not
+        # delay delivery of the event they actually asked for.
+        if our_jid, do: Whatsmeow.HistorySync.store_side_effects(our_jid, sync)
+
+      {:error, reason} ->
+        Logger.warning("[whatsmeow] history sync failed: #{inspect(reason)}", device_id: device_id)
+
+        Whatsmeow.Notifications.broadcast(device_id, %Events.HistorySyncFailed{
+          device_id: device_id,
+          reason: reason,
+          notification: notif
+        })
+    end
+  end
+
+  defp normalize_jid(%Whatsmeow.Types.JID{} = j), do: j
+
+  defp normalize_jid(s) when is_binary(s) do
+    case Whatsmeow.Types.JID.parse(s) do
+      {:ok, %Whatsmeow.Types.JID{} = j} -> j
+      _ -> nil
+    end
+  end
+
+  defp normalize_jid(_), do: nil
+
+  defp own_jid_string(%{device: %{jid: jid}}) when is_binary(jid) and jid != "", do: jid
+  defp own_jid_string(_), do: nil
+
+  # Delegates to `Whatsmeow.LIDMap`, which owns validation (both sides must be a
+  # well-formed LID / PN) and normalisation (strip the device suffix — a pairing
+  # is per person, not per device). The raw INSERT this used to do accepted
+  # anything the attribute happened to contain, including device-suffixed JIDs
+  # that then never matched a lookup.
+  defp persist_lid_pn(lid, pn), do: Whatsmeow.LIDMap.put(lid, pn)
 
   # Ask our PRIMARY phone (the device that paired us) to re-forward a
   # message our companion failed to decrypt. Runs as a fire-and-forget
@@ -1248,7 +1581,7 @@ defmodule Whatsmeow.Session do
   defp ensure_retry_table do
     case :ets.info(@retry_count_table) do
       :undefined ->
-        _ =
+        try do
           :ets.new(@retry_count_table, [
             :public,
             :named_table,
@@ -1256,6 +1589,13 @@ defmodule Whatsmeow.Session do
             read_concurrency: true,
             write_concurrency: true
           ])
+        rescue
+          # Two sessions starting at the same moment both see :undefined and both
+          # try to create the table; the loser gets ArgumentError. The table
+          # exists either way, which is all the caller needs. Without this, a
+          # second session booting concurrently crashes in `init/1`.
+          ArgumentError -> :ok
+        end
 
         :ok
 
@@ -1352,6 +1692,7 @@ defmodule Whatsmeow.Session do
   defp undecryptable_reason(:no_session), do: :no_session
   defp undecryptable_reason(:no_identity_pub), do: :no_identity_pub
   defp undecryptable_reason(:no_repo), do: :no_repo
+  defp undecryptable_reason(:no_store), do: :no_store
   defp undecryptable_reason(:no_enc), do: :no_enc
   defp undecryptable_reason(:mac_mismatch), do: :mac_mismatch
   defp undecryptable_reason(:bad_padding), do: :bad_padding
@@ -1952,7 +2293,7 @@ defmodule Whatsmeow.Session do
       {:ok, %{uploaded: n}} ->
         Logger.info("[whatsmeow] post-login prekey upload OK", uploaded: n, initial?: initial?)
 
-      {:error, :no_repo} ->
+      {:error, reason} when reason in [:no_repo, :no_store] ->
         Logger.debug("[whatsmeow] skipping prekey upload — Repo not started")
 
       {:error, reason} ->

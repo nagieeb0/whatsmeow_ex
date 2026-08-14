@@ -30,6 +30,26 @@ defmodule Whatsmeow.Config do
     do: Application.get_env(:whatsmeow_ex, :send_concurrency, 8)
 
   @doc """
+  How long a `Whatsmeow.Signal.Lock` critical section may hold its database
+  transaction, in ms. Defaults to 15 s.
+
+  The work inside is a local read, some crypto, and a local write — under a
+  millisecond. This bound is not for the work; it is so that a lock nobody can
+  acquire surfaces as an error instead of a hung send.
+
+  ## Keep this under your pool size
+
+  Every held lock holds one Ecto connection. Raising `:send_concurrency` above
+  `pool_size - 1` means a fanout can take every connection while the session
+  process is still waiting for one to release a lock — the classic pool
+  deadlock. With the defaults (concurrency 8, pool 10) there is headroom; if you
+  raise one, raise the other.
+  """
+  @spec lock_timeout_ms() :: pos_integer()
+  def lock_timeout_ms,
+    do: Application.get_env(:whatsmeow_ex, :lock_timeout_ms, 15_000)
+
+  @doc """
   Per-fanout-task timeout in ms (used as `:timeout` on `Task.async_stream`
   for the send fanout). Defaults to 60 s — comfortably above the 30 s
   default `:bundle_timeout` so a single slow prekey-bundle IQ doesn't

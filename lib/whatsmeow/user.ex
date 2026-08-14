@@ -22,6 +22,7 @@ defmodule Whatsmeow.User do
   alias Whatsmeow.IQ
   alias Whatsmeow.Session
   alias Whatsmeow.Types.JID
+  alias Whatsmeow.User.DeviceCache
 
   @server_jid "s.whatsapp.net"
   @default_timeout 30_000
@@ -138,9 +139,87 @@ defmodule Whatsmeow.User do
       ]
 
       with {:ok, list} <- usync(session, parsed, "full", "background", query, opts) do
-        {:ok, parse_user_info(list)}
+        info = parse_user_info(list)
+        # The server volunteered the LID alongside the phone number — that
+        # pairing is exactly what `Whatsmeow.LIDMap` exists to remember, and
+        # throwing it away here meant the same contact stayed unrecognisable
+        # the next time they arrived as a bare LID.
+        _ = cache_lid_mappings(info)
+        {:ok, info}
       end
     end
+  end
+
+  @doc """
+  Resolve contacts to their `{lid, pn}` pair.
+
+  Answers "is this LID the same person as this number?" — the question you have
+  to answer before a privacy-LID contact can be matched against an address book,
+  or before two Signal sessions can be recognised as one conversation.
+
+  Checks `Whatsmeow.LIDMap` first and only issues a USync for what's missing, so
+  repeat lookups cost nothing. Returns a list of
+  `%{lid: %JID{} | nil, pn: %JID{} | nil}`, one per input, in input order.
+  """
+  @spec resolve_lid(pid() | String.t(), [JID.t() | String.t()], keyword()) ::
+          {:ok, [%{lid: JID.t() | nil, pn: JID.t() | nil}]} | {:error, term()}
+  def resolve_lid(session, jids, opts \\ []) when is_list(jids) do
+    with {:ok, parsed} <- normalize_jids(jids) do
+      {cached, missing} =
+        Enum.split_with(parsed, fn jid -> not is_nil(pair_from_cache(jid)) end)
+
+      cached_pairs = Map.new(cached, fn jid -> {JID.to_string(jid), pair_from_cache(jid)} end)
+
+      fetched =
+        case missing do
+          [] ->
+            %{}
+
+          _ ->
+            case get_user_info(session, missing, opts) do
+              {:ok, info} ->
+                Map.new(info, fn {key, %Info{jid: jid, lid: lid}} -> {key, %{lid: lid, pn: jid}} end)
+
+              {:error, _} ->
+                %{}
+            end
+        end
+
+      all = Map.merge(cached_pairs, fetched)
+
+      {:ok,
+       Enum.map(parsed, fn jid ->
+         Map.get(all, JID.to_string(jid), %{lid: nil, pn: nil})
+       end)}
+    end
+  end
+
+  defp pair_from_cache(%JID{server: server} = jid) do
+    cond do
+      server == JID.hidden_user_server() ->
+        case Whatsmeow.LIDMap.pn_for(jid) do
+          %JID{} = pn -> %{lid: jid, pn: pn}
+          nil -> nil
+        end
+
+      server == JID.default_user_server() ->
+        case Whatsmeow.LIDMap.lid_for(jid) do
+          %JID{} = lid -> %{lid: lid, pn: jid}
+          nil -> nil
+        end
+
+      true ->
+        nil
+    end
+  end
+
+  defp cache_lid_mappings(info) when is_map(info) do
+    Enum.each(info, fn
+      {_key, %Info{jid: %JID{} = jid, lid: %JID{} = lid}} -> Whatsmeow.LIDMap.put(lid, jid)
+      _ -> :ok
+    end)
+  rescue
+    _ -> :ok
   end
 
   @doc """
@@ -289,10 +368,40 @@ defmodule Whatsmeow.User do
   # --- Internals -------------------------------------------------------------
 
   defp do_get_user_devices(session, jids, opts) do
+    # Validation runs before the cache, not inside the fetch: an unsupported
+    # server must be rejected whether or not we happen to hold an answer for it.
+    with :ok <- reject_unsupported_servers(jids) do
+      # Device lists barely change, and this call sits on the critical path of
+      # every send. Serve what we already know and only ask the server about the
+      # rest — a burst of messages to one chat then costs a single USync instead
+      # of one per message. Pass `cache: false` to force a round-trip.
+      if Keyword.get(opts, :cache, true) do
+        {hits, misses} =
+          Enum.reduce(jids, {[], []}, fn jid, {hits, misses} ->
+            case DeviceCache.get(jid) do
+              {:ok, devices} -> {devices ++ hits, misses}
+              :miss -> {hits, [jid | misses]}
+            end
+          end)
+
+        case Enum.reverse(misses) do
+          [] ->
+            {:ok, hits}
+
+          missing ->
+            with {:ok, fetched} <- fetch_user_devices(session, missing, opts),
+                 do: {:ok, hits ++ fetched}
+        end
+      else
+        fetch_user_devices(session, jids, opts)
+      end
+    end
+  end
+
+  defp fetch_user_devices(session, jids, opts) do
     query = [Node.new("devices", %{"version" => "2"}, nil)]
 
-    with :ok <- reject_unsupported_servers(jids),
-         {:ok, list} <- usync(session, jids, "query", "message", query, opts) do
+    with {:ok, list} <- usync(session, jids, "query", "message", query, opts) do
       devices =
         list
         |> Node.get_children("user")
@@ -303,6 +412,7 @@ defmodule Whatsmeow.User do
           end
         end)
 
+      _ = DeviceCache.put_response(jids, devices)
       {:ok, devices}
     end
   end

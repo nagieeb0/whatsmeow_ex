@@ -27,7 +27,8 @@ defmodule Whatsmeow.Media.Download do
   alias Whatsmeow.Crypto.{AES, HKDF}
   alias Whatsmeow.Media.{Conn, Finch}
 
-  @type media_type :: :image | :video | :audio | :document | :sticker | :voice
+  @type media_type ::
+          :image | :video | :audio | :document | :sticker | :voice | :history | :app_state
 
   @doc """
   Fetch a remote ciphertext blob and decrypt under `media_key`.
@@ -152,6 +153,8 @@ defmodule Whatsmeow.Media.Download do
   defp mms_type(:voice), do: "audio"
   defp mms_type(:document), do: "document"
   defp mms_type(:sticker), do: "image"
+  defp mms_type(:history), do: "md-msg-hist"
+  defp mms_type(:app_state), do: "md-app-state"
 
   # --- HTTP fan-out over hosts -------------------------------------------
 
@@ -211,6 +214,11 @@ defmodule Whatsmeow.Media.Download do
   defp info_for(:audio), do: "WhatsApp Audio Keys"
   defp info_for(:document), do: "WhatsApp Document Keys"
   defp info_for(:sticker), do: "WhatsApp Image Keys"
+  # Not user media: the history-sync blob pushed on first link, and app-state
+  # snapshot/patch blobs too large to inline. Same media crypto, different info
+  # string. See `whatsmeow-main/download.go:47`.
+  defp info_for(:history), do: "WhatsApp History Keys"
+  defp info_for(:app_state), do: "WhatsApp App State Keys"
 
   defp cached_or_derive(media_key, info) do
     case Whatsmeow.Media.HKDFCache.get(media_key, info) do

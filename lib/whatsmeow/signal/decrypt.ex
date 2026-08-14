@@ -19,15 +19,15 @@ defmodule Whatsmeow.Signal.Decrypt do
   or smoke task) handles the surrounding stanza handling — ack,
   delivery receipt, broadcasting `%Events.Message{}`, etc.
 
-  Falls back to the no-op `{:error, :no_repo}` if `Whatsmeow.Repo` isn't
+  Falls back to the no-op `{:error, :no_store}` if no Signal store is
   started — unit tests don't run a Postgres so we keep this graceful.
   """
 
   alias Whatsmeow.Binary.Node
   alias Whatsmeow.Crypto.Curve25519
   alias Whatsmeow.MessageInfo
-  alias Whatsmeow.Signal.{GroupDecrypt, GroupSession, SenderKeyWire, Wire, WireDecrypt}
-  alias Whatsmeow.Store.Schemas.{Device, IdentityKey}
+  alias Whatsmeow.Signal.{GroupDecrypt, GroupSession, Lock, SenderKeyWire, Wire, WireDecrypt}
+  alias Whatsmeow.Store.Schemas.Device
   alias Whatsmeow.Types.JID
 
   @type result :: %{
@@ -40,6 +40,7 @@ defmodule Whatsmeow.Signal.Decrypt do
   @type error ::
           :no_enc
           | :no_repo
+          | :no_store
           | :no_session
           | :no_identity_pub
           | :no_group_session
@@ -85,6 +86,14 @@ defmodule Whatsmeow.Signal.Decrypt do
   # --- pkmsg (first-contact) ----------------------------------------------
 
   defp decrypt_pkmsg(envelope, %Device{} = device, %MessageInfo{} = info) do
+    # Same serialisation as `decrypt_msg/3`: a pkmsg replaces the whole session
+    # record, so it must not interleave with a send encrypting the old one.
+    Lock.with_session(device.jid, peer_id(info), fn ->
+      do_decrypt_pkmsg(envelope, device, info)
+    end)
+  end
+
+  defp do_decrypt_pkmsg(envelope, %Device{} = device, %MessageInfo{} = info) do
     # Peek the envelope to find the `preKeyId` the peer used in X3DH.
     # Modern WhatsApp always picks one of our uploaded OPKs — when we
     # do X3DH responder without that OPK's private half, the derived
@@ -137,15 +146,8 @@ defmodule Whatsmeow.Signal.Decrypt do
   # that always pick an OPK.
   defp lookup_opk_priv(envelope, our_jid) when is_binary(our_jid) do
     with {:ok, %Wire.PreKeySignalMessage{preKeyId: id}} when is_integer(id) <-
-           Wire.decode_prekey_signal_message(envelope),
-         true <- repo_up?() do
-      case Whatsmeow.Repo.get_by(Whatsmeow.Store.Schemas.PreKey, jid: our_jid, key_id: id) do
-        %Whatsmeow.Store.Schemas.PreKey{key: priv} when is_binary(priv) and byte_size(priv) == 32 ->
-          priv
-
-        _ ->
-          nil
-      end
+           Wire.decode_prekey_signal_message(envelope) do
+      Whatsmeow.Signal.Store.Adapter.load_prekey(our_jid, id)
     else
       _ -> nil
     end
@@ -160,6 +162,17 @@ defmodule Whatsmeow.Signal.Decrypt do
   defp decrypt_msg(envelope, %Device{} = device, %MessageInfo{} = info) do
     their_id = peer_id(info)
 
+    # Load, decrypt, and store are one atomic step against a concurrent encrypt
+    # of the same session record — see `Whatsmeow.Signal.Lock`. Without this the
+    # send path's store can land on top of ours and drop the receive chain's
+    # skipped-message keys, which is what leaves a chat stuck on "Waiting for
+    # this message".
+    Lock.with_session(device.jid, their_id, fn ->
+      do_decrypt_msg(envelope, device, info, their_id)
+    end)
+  end
+
+  defp do_decrypt_msg(envelope, %Device{} = device, %MessageInfo{}, their_id) do
     with {:ok, sess} <- load_session(device.jid, their_id),
          their_id_pub when is_binary(their_id_pub) and byte_size(their_id_pub) == 32 <-
            load_identity_pub(device.jid, their_id) do
@@ -193,17 +206,12 @@ defmodule Whatsmeow.Signal.Decrypt do
   Persist (or replace) the Signal session for `(our_jid, their_id)`.
 
   Returns `:ok` on success, `{:error, reason}` if Postgres is reachable
-  but the write failed, or `{:error, :no_repo}` if the repo isn't up.
+  but the write failed, or `{:error, :no_store}` if no store is configured.
   """
   @spec persist_session(String.t(), String.t(), Whatsmeow.Signal.Session.t()) ::
           :ok | {:error, term()}
-  def persist_session(our_jid, their_id, session) do
-    if repo_up?() do
-      Whatsmeow.Signal.Store.Postgres.put(our_jid, their_id, session)
-    else
-      {:error, :no_repo}
-    end
-  end
+  def persist_session(our_jid, their_id, session),
+    do: Whatsmeow.Signal.Store.Adapter.save_session(our_jid, their_id, session)
 
   @doc """
   Persist (or replace) a peer's 32-byte identity public key.
@@ -217,55 +225,14 @@ defmodule Whatsmeow.Signal.Decrypt do
   def stash_identity_pub(_our_jid, _their_id, <<>>), do: :skipped
 
   def stash_identity_pub(our_jid, their_id, identity_pub)
-      when is_binary(identity_pub) and byte_size(identity_pub) == 32 do
-    if repo_up?() do
-      %IdentityKey{}
-      |> IdentityKey.changeset(%{
-        our_jid: our_jid,
-        their_id: their_id,
-        identity: identity_pub
-      })
-      |> Whatsmeow.Repo.insert(
-        on_conflict: {:replace, [:identity]},
-        conflict_target: [:our_jid, :their_id]
-      )
-      |> case do
-        {:ok, _} -> :ok
-        {:error, _} = err -> err
-      end
-    else
-      {:error, :no_repo}
-    end
-  end
+      when is_binary(identity_pub) and byte_size(identity_pub) == 32,
+      do: Whatsmeow.Signal.Store.Adapter.save_identity(our_jid, their_id, identity_pub)
 
-  defp load_session(our_jid, their_id) do
-    if repo_up?() do
-      Whatsmeow.Signal.Store.Postgres.get(our_jid, their_id)
-    else
-      :not_found
-    end
-  end
+  defp load_session(our_jid, their_id),
+    do: Whatsmeow.Signal.Store.Adapter.load_session(our_jid, their_id)
 
-  defp load_identity_pub(our_jid, their_id) do
-    if repo_up?() do
-      case Whatsmeow.Repo.get_by(IdentityKey, our_jid: our_jid, their_id: their_id) do
-        %IdentityKey{identity: id_pub}
-        when is_binary(id_pub) and byte_size(id_pub) == 32 ->
-          id_pub
-
-        _ ->
-          nil
-      end
-    else
-      nil
-    end
-  rescue
-    _ -> nil
-  end
-
-  defp repo_up? do
-    Code.ensure_loaded?(Whatsmeow.Repo) and is_pid(Process.whereis(Whatsmeow.Repo))
-  end
+  defp load_identity_pub(our_jid, their_id),
+    do: Whatsmeow.Signal.Store.Adapter.load_identity(our_jid, their_id)
 
   # peer_id keys our persistence by the *full* JID string the message
   # came `from=`. Group messages carry `participant=...`; we key by the
@@ -278,15 +245,28 @@ defmodule Whatsmeow.Signal.Decrypt do
 
   defp decrypt_skmsg(envelope, %Device{} = device, %MessageInfo{} = info) do
     with %JID{} = chat_jid <- group_chat_jid(info),
-         sender_id when is_binary(sender_id) <- group_sender_id(info),
-         chat_id = JID.to_string(chat_jid),
-         {:ok, %GroupSession{} = gs} <- load_group_session(device.jid, chat_id, sender_id),
+         sender_id when is_binary(sender_id) <- group_sender_id(info) do
+      chat_id = JID.to_string(chat_jid)
+
+      # A sender-key record advances its chain on every decrypt, so the same
+      # read-modify-write rule as 1:1 sessions applies — two messages from the
+      # same group member arriving together must not both start from the same
+      # chain key.
+      Lock.with_sender_key(device.jid, chat_id, sender_id, fn ->
+        do_decrypt_skmsg(envelope, device, chat_id, sender_id)
+      end)
+    else
+      nil -> {:error, :no_chat}
+    end
+  end
+
+  defp do_decrypt_skmsg(envelope, %Device{} = device, chat_id, sender_id) do
+    with {:ok, %GroupSession{} = gs} <- load_group_session(device.jid, chat_id, sender_id),
          {:ok, plain, gs2} <- GroupDecrypt.decrypt_envelope(envelope, gs),
          _ <- persist_group_session(device.jid, chat_id, sender_id, gs2) do
       {:ok, %{plaintext: plain, enc_type: "skmsg", pkmsg: nil}}
     else
       :not_found -> {:error, :no_group_session}
-      nil -> {:error, :no_chat}
       {:error, _} = err -> err
     end
   rescue
@@ -341,7 +321,13 @@ defmodule Whatsmeow.Signal.Decrypt do
     with {:ok, sdkm} <- SenderKeyWire.decode_sender_key_distribution_message(axolotl),
          {:ok, %GroupSession{} = gs} <- GroupSession.from_distribution(sdkm),
          sender_id when is_binary(sender_id) <- peer_id_for_skdm(info) do
-      persist_group_session(our_jid, group_id, sender_id, gs)
+      # Under the sender-key lock: this is a blind whole-record overwrite with a
+      # fresh chain at iteration 0. Landing it in the middle of a concurrent
+      # `decrypt_skmsg` read-modify-write would reset an already-advanced chain
+      # and make every message after it undecryptable.
+      Lock.with_sender_key(our_jid, group_id, sender_id, fn ->
+        persist_group_session(our_jid, group_id, sender_id, gs)
+      end)
     else
       _ -> :error
     end
@@ -393,19 +379,9 @@ defmodule Whatsmeow.Signal.Decrypt do
   """
   @spec persist_group_session(String.t(), String.t(), String.t(), GroupSession.t()) ::
           :ok | {:error, term()}
-  def persist_group_session(our_jid, chat_id, sender_id, %GroupSession{} = gs) do
-    if repo_up?() do
-      Whatsmeow.Signal.GroupSession.Store.Postgres.put(our_jid, chat_id, sender_id, gs)
-    else
-      {:error, :no_repo}
-    end
-  end
+  def persist_group_session(our_jid, chat_id, sender_id, %GroupSession{} = gs),
+    do: Whatsmeow.Signal.Store.Adapter.save_sender_key(our_jid, chat_id, sender_id, gs)
 
-  defp load_group_session(our_jid, chat_id, sender_id) do
-    if repo_up?() do
-      Whatsmeow.Signal.GroupSession.Store.Postgres.get(our_jid, chat_id, sender_id)
-    else
-      :not_found
-    end
-  end
+  defp load_group_session(our_jid, chat_id, sender_id),
+    do: Whatsmeow.Signal.Store.Adapter.load_sender_key(our_jid, chat_id, sender_id)
 end
