@@ -8,68 +8,16 @@ defmodule Whatsmeow.Store.Postgres do
 
   @behaviour Whatsmeow.Store
 
-  alias Whatsmeow.Crypto.{Curve25519, XEdDSA}
   alias Whatsmeow.Repo
   alias Whatsmeow.Store.Schemas
 
   @impl true
   def new_device(opts) do
-    # X25519 keys MUST come from `Curve25519.generate_keypair/0` (which
-    # calls `:crypto.generate_key(:ecdh, :x25519)`) so the returned
-    # private scalar is RFC-7748 clamped. Using `:crypto.strong_rand_bytes/1`
-    # here was a latent bug: ECDH clamps internally so the Noise handshake
-    # still succeeds, but `XEdDSA.sign/3` assumes a pre-clamped scalar and
-    # signs over the Ed25519 pub of the RAW (unclamped) scalar. The
-    # `signed_pre_key_sig` then fails verification against the X25519
-    # `identity_key` pub we publish — the server rejects the pair-device
-    # session with `<stream:error code="500">` (ConnectFailureInternalServerError)
-    # immediately after the Noise handshake. Smoke CLI never hit this
-    # because it always uses `Curve25519.generate_keypair/0`.
-    identity_key = Keyword.get_lazy(opts, :identity_key, &fresh_private/0)
-    signed_pre_key = Keyword.get_lazy(opts, :signed_pre_key, &fresh_private/0)
-    noise_key = Keyword.get_lazy(opts, :noise_key, &fresh_private/0)
-
-    signed_pre_key_sig =
-      Keyword.get_lazy(opts, :signed_pre_key_sig, fn ->
-        derive_signed_pre_key_sig(identity_key, signed_pre_key)
-      end)
-
-    jid = Keyword.get_lazy(opts, :jid, fn -> "device-" <> random_id() end)
-    client_id = Keyword.get(opts, :client_id, jid)
-
-    %Schemas.Device{
-      jid: jid,
-      client_id: client_id,
-      registration_id: Keyword.get(opts, :registration_id, :rand.uniform(4_294_967_296) - 1),
-      noise_key: noise_key,
-      identity_key: identity_key,
-      signed_pre_key: signed_pre_key,
-      signed_pre_key_id: Keyword.get(opts, :signed_pre_key_id, 1),
-      signed_pre_key_sig: signed_pre_key_sig,
-      adv_key: Keyword.get(opts, :adv_key, :crypto.strong_rand_bytes(32)),
-      adv_details: Keyword.get(opts, :adv_details, <<>>),
-      adv_account_sig: Keyword.get(opts, :adv_account_sig, :crypto.strong_rand_bytes(64)),
-      adv_account_sig_key: Keyword.get(opts, :adv_account_sig_key, :crypto.strong_rand_bytes(32)),
-      adv_device_sig: Keyword.get(opts, :adv_device_sig, :crypto.strong_rand_bytes(64)),
-      # Per-device fingerprint persona (UA/device-props). Caller passes a random
-      # one so numbers don't all look like the same client; nil falls back to
-      # the app-env/default persona at payload-build time.
-      persona: Keyword.get(opts, :persona)
-    }
+    # Construction (including the clamping and XEdDSA subtleties) lives in
+    # `Whatsmeow.Store.build_device/1` so every adapter shares one copy.
+    opts
+    |> Whatsmeow.Store.build_device()
     |> Repo.insert()
-  end
-
-  defp fresh_private do
-    {_pub, priv} = Curve25519.generate_keypair()
-    priv
-  end
-
-  # Mirror Go's keys.KeyPair.Sign — XEdDSA over DjbType(5) ‖ spk.pub using
-  # the identity key's private scalar. Random bytes here trigger
-  # <stream:error code="500"> immediately after the Noise handshake.
-  defp derive_signed_pre_key_sig(identity_priv, spk_priv) do
-    spk_pub = Curve25519.public_for(spk_priv)
-    XEdDSA.sign(identity_priv, <<5, spk_pub::binary>>)
   end
 
   @impl true
@@ -118,6 +66,37 @@ defmodule Whatsmeow.Store.Postgres do
     batch = Keyword.get(opts, :batch_size, 500)
     Repo.stream(Schemas.Device, max_rows: batch)
   end
+
+  @impl true
+  def put_device(%Schemas.Device{client_id: cid} = device) when is_binary(cid) and cid != "" do
+    # UPDATE the row keyed by client_id rather than inserting a second one:
+    # pairing rewrites `device.jid`, and the FK cascade (`on_update: :update_all`)
+    # then migrates the signal/prekey/session rows to the new jid with it.
+    case Repo.get_by(Schemas.Device, client_id: cid) do
+      nil ->
+        device
+        |> Schemas.Device.changeset(Map.from_struct(device))
+        |> Repo.insert()
+        |> persist_result()
+
+      %Schemas.Device{} = existing ->
+        existing
+        |> Schemas.Device.changeset(Map.from_struct(device))
+        |> Repo.update()
+        |> persist_result()
+    end
+  end
+
+  def put_device(%Schemas.Device{} = device) do
+    device
+    |> Schemas.Device.changeset(Map.from_struct(device))
+    |> Repo.insert(on_conflict: :replace_all, conflict_target: [:jid])
+    |> persist_result()
+  end
+
+  defp persist_result({:ok, _}), do: :ok
+  defp persist_result({:error, %Ecto.Changeset{} = cs}), do: {:error, cs.errors}
+  defp persist_result({:error, reason}), do: {:error, reason}
 
   @impl true
   def delete_device(device_id) do
@@ -256,6 +235,4 @@ defmodule Whatsmeow.Store.Postgres do
       rec -> {:ok, rec.key}
     end
   end
-
-  defp random_id, do: Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)
 end

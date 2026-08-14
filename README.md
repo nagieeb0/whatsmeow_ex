@@ -215,16 +215,23 @@ The device is loaded from the store at start, so a restart after pairing doesn't
 
 ## Running without Postgres
 
-The Signal layer can go to disk instead:
+Both persistence seams have a DETS adapter, so the whole library runs from a directory:
 
 ```elixir
-config :whatsmeow_ex, signal_store: Whatsmeow.Signal.Store.DETS
-config :whatsmeow_ex, signal_store_dir: "./whatsmeow_data"
+config :whatsmeow_ex,
+  store: Whatsmeow.Store.DETS,                    # device / account records
+  signal_store: Whatsmeow.Signal.Store.DETS,      # sessions, sender keys, identity keys, prekeys
+  store_dir: "./whatsmeow_data",
+  signal_store_dir: "./whatsmeow_data",
+  start_repo?: false
 ```
 
-Covers everything the Signal layer needs — sessions, sender keys, peer identity keys, and one-time prekeys — so an account can pair and decrypt with no database.
+That is enough to pair, reconnect, send, and decrypt. Two caveats, both real:
 
-Single-node only, and **without a Repo the session lock is a no-op**, so send and receive can still interleave on the same record within one node. Fine for a quiet bot; use Postgres for anything busy. Device records, app-state, contacts, and chat settings still require the Repo either way.
+- **Single node**, and **without a Repo the session lock is a no-op** — `Whatsmeow.Signal.Lock` is a Postgres advisory lock, so with DETS the send and receive paths can still interleave on the same Signal record. Fine for a quiet bot; use Postgres for anything busy.
+- **No encryption at rest.** `Whatsmeow.Vault` protects the Postgres columns through Ecto types; DETS blobs are written in the clear. The directory holds your account's live identity — `.gitignore` it and keep it out of images and logs.
+
+Writing your own backend means implementing `Whatsmeow.Store` (5 device callbacks) and/or `Whatsmeow.Signal.Store.Adapter`'s eight operations. Neither is large; the DETS adapters are the reference.
 
 ## Things that fail silently without them
 

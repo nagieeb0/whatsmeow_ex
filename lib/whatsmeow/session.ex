@@ -2271,17 +2271,11 @@ defmodule Whatsmeow.Session do
   # for our_jid, treat this as a fresh device and upload the big
   # initial batch (812 keys). Otherwise it's a top-up.
   defp needs_initial_prekey_upload?(%Device{jid: jid}) when is_binary(jid) do
-    if Code.ensure_loaded?(Whatsmeow.Repo) and is_pid(Process.whereis(Whatsmeow.Repo)) do
-      import Ecto.Query
-
-      count =
-        from(p in Whatsmeow.Store.Schemas.PreKey, where: p.jid == ^jid, select: count(p.key_id))
-        |> Whatsmeow.Repo.one()
-
-      count in [nil, 0]
-    else
-      false
-    end
+    # Through the Signal store seam rather than a direct query: with a non-Repo
+    # adapter this used to answer `false` unconditionally, so a fresh device
+    # skipped its initial 812-key upload and every peer's first message failed.
+    Whatsmeow.Signal.Store.Adapter.available?() and
+      Whatsmeow.Signal.Store.Adapter.max_prekey_id(jid) == 0
   rescue
     _ -> false
   end
@@ -2346,34 +2340,19 @@ defmodule Whatsmeow.Session do
   # signal/prekey/session rows to the new jid. We fall back to a plain
   # insert when no row matches the client_id yet (or when the device has
   # no client_id at all — older test fixtures).
-  defp do_persist_device(%Device{client_id: cid} = device) when is_binary(cid) and cid != "" do
-    case Whatsmeow.Repo.get_by(Device, client_id: cid) do
-      nil ->
-        device
-        |> Device.changeset(Map.from_struct(device))
-        |> Whatsmeow.Repo.insert()
-        |> handle_persist_result()
-
-      %Device{} = existing ->
-        existing
-        |> Device.changeset(Map.from_struct(device))
-        |> Whatsmeow.Repo.update()
-        |> handle_persist_result()
-    end
-  end
-
   defp do_persist_device(%Device{} = device) do
-    device
-    |> Device.changeset(Map.from_struct(device))
-    |> Whatsmeow.Repo.insert(on_conflict: :replace_all, conflict_target: [:jid])
-    |> handle_persist_result()
-  end
+    # Through `Whatsmeow.Store.impl/0` so a non-Postgres store sees pairing
+    # results too. Writing straight to the Repo here meant the credentials
+    # written at pair time went somewhere the configured store never reads,
+    # and the next boot asked for a fresh QR.
+    case Whatsmeow.Store.put_device(device) do
+      :ok ->
+        :ok
 
-  defp handle_persist_result({:ok, _}), do: :ok
-
-  defp handle_persist_result({:error, cs}) do
-    Logger.warning("[whatsmeow] device persist failed", errors: inspect(cs.errors))
-    :error
+      {:error, reason} ->
+        Logger.warning("[whatsmeow] device persist failed", errors: inspect(reason))
+        :error
+    end
   end
 
   defp parse_jid_or_nil(nil), do: nil

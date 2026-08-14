@@ -520,29 +520,13 @@ defmodule Whatsmeow.Send do
   defp load_session(our_jid, their_id),
     do: Whatsmeow.Signal.Store.Adapter.load_session(our_jid, their_id)
 
-  defp load_identity_pub(our_jid, their_id) do
-    if repo_up?() do
-      case Whatsmeow.Repo.get_by(Whatsmeow.Store.Schemas.IdentityKey,
-             our_jid: our_jid,
-             their_id: their_id
-           ) do
-        %Whatsmeow.Store.Schemas.IdentityKey{identity: id_pub}
-        when is_binary(id_pub) and byte_size(id_pub) == 32 ->
-          id_pub
-
-        _ ->
-          nil
-      end
-    else
-      nil
-    end
-  rescue
-    _ -> nil
-  end
-
-  defp repo_up? do
-    Code.ensure_loaded?(Whatsmeow.Repo) and is_pid(Process.whereis(Whatsmeow.Repo))
-  end
+  # Through the adapter, not straight to the Repo. Reading identity keys from
+  # Postgres here while `Whatsmeow.Signal.Decrypt` reads them from whatever store
+  # is configured gives the send and receive paths two different answers for the
+  # same peer — under the DETS adapter the send path would find nothing and fall
+  # back to a needless X3DH on every message.
+  defp load_identity_pub(our_jid, their_id),
+    do: Whatsmeow.Signal.Store.Adapter.load_identity(our_jid, their_id)
 
   defp to_jid(%JID{} = j), do: {:ok, j}
 
