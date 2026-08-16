@@ -77,7 +77,7 @@ defmodule Whatsmeow.Transport.NoiseHandshake do
   @spec decrypt(t(), binary()) :: {:ok, binary(), t()} | {:error, :auth_failed}
   def decrypt(%__MODULE__{} = nh, blob) when byte_size(blob) >= 16 do
     ct_len = byte_size(blob) - 16
-    <<ct::binary-size(ct_len), tag::binary-size(16)>> = blob
+    <<ct::binary-size(^ct_len), tag::binary-size(16)>> = blob
     {iv, nh1} = next_iv(nh)
 
     case AES.GCM.decrypt(nh.key, iv, ct, nh.hash, tag) do

@@ -57,7 +57,7 @@ defmodule Whatsmeow.Crypto.AES.CBC do
 
       true ->
         unpadded_size = byte_size(bin) - pad_len
-        <<unpadded::binary-size(unpadded_size), tail::binary>> = bin
+        <<unpadded::binary-size(^unpadded_size), tail::binary>> = bin
 
         if tail == :binary.copy(<<pad_len>>, pad_len) do
           {:ok, unpadded}

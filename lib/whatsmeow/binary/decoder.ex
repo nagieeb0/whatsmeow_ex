@@ -292,14 +292,14 @@ defmodule Whatsmeow.Binary.Decoder do
   # ---- Low-level readers ---------------------------------------------------
 
   defp read_int_be(bin, n) when byte_size(bin) >= n do
-    <<value::big-unsigned-size(n)-unit(8), rest::binary>> = bin
+    <<value::big-unsigned-size(^n)-unit(8), rest::binary>> = bin
     {:ok, value, rest}
   end
 
   defp read_int_be(_bin, _n), do: {:error, :eof}
 
   defp read_raw(bin, n) when byte_size(bin) >= n do
-    <<data::binary-size(n), rest::binary>> = bin
+    <<data::binary-size(^n), rest::binary>> = bin
     {:ok, data, rest}
   end
 

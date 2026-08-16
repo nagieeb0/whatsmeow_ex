@@ -1047,6 +1047,12 @@ defmodule Whatsmeow.Session do
 
     case Whatsmeow.MessageInfo.from_node(msg, own_jid) do
       {:ok, info} ->
+        # The server volunteers the sender's other address on some stanzas and
+        # not others. Recording it the moment it appears is what makes the
+        # quiet ones resolvable later, and it is the only live-path source of
+        # the mapping outside the history sync that runs once at link time.
+        learn_sender_alt(info)
+
         # Always ack first so the server doesn't resend on a slow decrypt.
         ack = Whatsmeow.Receipt.build_ack(msg)
         {:ok, state} = do_send_node(state, ack) |> ok_or_keep(state)
@@ -1404,8 +1410,6 @@ defmodule Whatsmeow.Session do
     _ -> :ok
   end
 
-  defp maybe_start_history_sync(_state, _msg, _info), do: :ok
-
   # `<receipt type="hist_sync" to="<our own jid>" id="<message id>"/>`.
   # Ports Go's `SendProtocolMessageReceipt` (`whatsmeow-main/message.go:853`).
   defp build_history_sync_receipt(state, message_id) when is_binary(message_id) do
@@ -1458,8 +1462,6 @@ defmodule Whatsmeow.Session do
   rescue
     _ -> :ok
   end
-
-  defp maybe_store_message_secret(_state, _msg, _info), do: :ok
 
   defp message_secret(%WAWebProtobufsE2E.Message{
          messageContextInfo: %WAWebProtobufsE2E.MessageContextInfo{messageSecret: secret}
@@ -1515,13 +1517,28 @@ defmodule Whatsmeow.Session do
   # that then never matched a lookup.
   defp persist_lid_pn(lid, pn), do: Whatsmeow.LIDMap.put(lid, pn)
 
+  # `LIDMap.put/2` validates which side is which, so this only has to decide
+  # that there are two addresses to pair at all.
+  defp learn_sender_alt(%Whatsmeow.MessageInfo{sender_alt: %Whatsmeow.Types.JID{} = alt} = info) do
+    sender = if info.is_group?, do: info.participant, else: info.from
+
+    case {sender, alt} do
+      {%Whatsmeow.Types.JID{} = sender, alt} ->
+        persist_lid_pn(sender, alt)
+        persist_lid_pn(alt, sender)
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp learn_sender_alt(_info), do: :ok
+
   # Ask our PRIMARY phone (the device that paired us) to re-forward a
   # message our companion failed to decrypt. Runs as a fire-and-forget
   # `Task.start` so a slow IQ round-trip doesn't stall the receive
   # loop. Errors are intentionally swallowed — at worst the retry
   # receipt still works.
-  defp request_message_from_phone(_state, nil), do: :ok
-
   defp request_message_from_phone(state, %Whatsmeow.MessageInfo{} = info) do
     server = self()
     chat = info.from

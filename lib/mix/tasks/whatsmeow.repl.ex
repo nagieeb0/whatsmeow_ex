@@ -34,7 +34,6 @@ defmodule Mix.Tasks.Whatsmeow.Repl do
   alias Whatsmeow.Store.Schemas.Device
   alias Whatsmeow.Types.Events
 
-  require Logger
 
   @impl Mix.Task
   def run(argv) do

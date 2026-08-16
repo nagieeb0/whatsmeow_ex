@@ -64,7 +64,7 @@ defmodule Whatsmeow.Argo.SelfDescribing do
   defp decode_marker(@marker_string, bin) do
     with {len, rest} <- Label.read(bin),
          {:ok, str} <- take(rest, len) do
-      <<value::binary-size(len), tail::binary>> = str
+      <<value::binary-size(^len), tail::binary>> = str
       {:ok, value, tail}
     end
   end
@@ -72,7 +72,7 @@ defmodule Whatsmeow.Argo.SelfDescribing do
   defp decode_marker(@marker_bytes, bin) do
     with {len, rest} <- Label.read(bin),
          {:ok, raw} <- take(rest, len) do
-      <<value::binary-size(len), tail::binary>> = raw
+      <<value::binary-size(^len), tail::binary>> = raw
       {:ok, value, tail}
     end
   end
@@ -120,7 +120,7 @@ defmodule Whatsmeow.Argo.SelfDescribing do
   defp decode_object(bin, remaining, acc) do
     with {key_len, after_keylen} <- Label.read(bin),
          {:ok, with_key} <- take(after_keylen, key_len),
-         <<key::binary-size(key_len), after_key::binary>> = with_key,
+         <<key::binary-size(^key_len), after_key::binary>> = with_key,
          {:ok, value, rest} <- decode(after_key) do
       decode_object(rest, remaining - 1, Map.put(acc, key, value))
     end

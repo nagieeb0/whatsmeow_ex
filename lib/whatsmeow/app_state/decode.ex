@@ -48,7 +48,7 @@ defmodule Whatsmeow.AppState.Decode do
       when op in [:set, :remove] and is_binary(blob) and byte_size(blob) >= 16 + 32 do
     blob_size = byte_size(blob)
     ct_size = blob_size - 32
-    <<iv_and_ct::binary-size(ct_size), value_mac::binary-size(32)>> = blob
+    <<iv_and_ct::binary-size(^ct_size), value_mac::binary-size(32)>> = blob
 
     with :ok <- maybe_verify_content_mac(validate_macs, op, iv_and_ct, key_id, vmac_key, value_mac) do
       <<iv::binary-size(16), ct::binary>> = iv_and_ct

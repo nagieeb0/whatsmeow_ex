@@ -40,7 +40,6 @@ defmodule Whatsmeow.PreKeys do
   reference this `preKeyId`.
   """
 
-  require Logger
 
   alias Whatsmeow.Binary.Node
   alias Whatsmeow.Crypto.Curve25519

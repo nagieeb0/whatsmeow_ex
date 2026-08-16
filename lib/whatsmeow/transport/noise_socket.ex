@@ -43,7 +43,7 @@ defmodule Whatsmeow.Transport.NoiseSocket do
   @spec decrypt(t(), binary()) :: {:ok, binary(), t()} | {:error, :auth_failed}
   def decrypt(%__MODULE__{} = ns, blob) when byte_size(blob) >= 16 do
     ct_len = byte_size(blob) - 16
-    <<ct::binary-size(ct_len), tag::binary-size(16)>> = blob
+    <<ct::binary-size(^ct_len), tag::binary-size(16)>> = blob
     iv = <<0::64, ns.read_counter::big-unsigned-32>>
 
     case AES.GCM.decrypt(ns.read_key, iv, ct, <<>>, tag) do

@@ -472,11 +472,11 @@ defmodule Mix.Tasks.Whatsmeow.Smoke do
       payload =
         case ws_bytes do
           <<0x82, len, rest::binary>> when len < 126 ->
-            <<chunk::binary-size(len), _::binary>> = rest
+            <<chunk::binary-size(^len), _::binary>> = rest
             chunk
 
           <<0x82, 126, len::big-16, rest::binary>> ->
-            <<chunk::binary-size(len), _::binary>> = rest
+            <<chunk::binary-size(^len), _::binary>> = rest
             chunk
 
           other ->

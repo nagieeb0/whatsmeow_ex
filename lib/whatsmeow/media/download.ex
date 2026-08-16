@@ -83,7 +83,7 @@ defmodule Whatsmeow.Media.Download do
       {:error, :body_too_short}
     else
       ct_len = byte_size(body) - 10
-      <<ct::binary-size(ct_len), tag::binary-size(10)>> = body
+      <<ct::binary-size(^ct_len), tag::binary-size(10)>> = body
 
       # Cache the 112-byte HKDF expansion by `{media_key, info_for/1}` —
       # bursts of inbound media (album fanout, history-sync replay) hit

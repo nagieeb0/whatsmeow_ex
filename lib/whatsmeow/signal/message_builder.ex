@@ -60,12 +60,14 @@ defmodule Whatsmeow.Signal.MessageBuilder do
     attachments = extract_attachments(inner)
 
     {chat, sender} = derive_chat_and_sender(info)
+    sender_alt = resolve_sender_alt(info, sender)
 
     msg = %Message{
       id: info.id,
       from: info.from,
       chat: chat,
       sender: sender,
+      sender_alt: sender_alt,
       timestamp: info.timestamp,
       push_name: info.push_name,
       body: body,
@@ -255,6 +257,21 @@ defmodule Whatsmeow.Signal.MessageBuilder do
 
   # Individual chats: chat == sender == info.from.
   # Group chats: chat == info.from (g.us), sender == info.participant.
+  # The stanza usually carries the sender's other address outright. When it does
+  # not — the server only volunteers it some of the time — fall back to what
+  # earlier stanzas and the history sync taught us. Without the fallback, the
+  # phone number appears on the first message from a contact and then vanishes
+  # on the second, which is worse than never having it.
+  defp resolve_sender_alt(%MessageInfo{sender_alt: %JID{} = alt}, _sender), do: alt
+
+  defp resolve_sender_alt(_info, %JID{server: server} = sender) do
+    if server in [JID.hidden_user_server(), JID.hosted_lid_server()] do
+      Whatsmeow.LIDMap.pn_for(sender)
+    end
+  end
+
+  defp resolve_sender_alt(_info, _sender), do: nil
+
   defp derive_chat_and_sender(%MessageInfo{is_group?: true, from: chat, participant: %JID{} = p}),
     do: {chat, p}
 

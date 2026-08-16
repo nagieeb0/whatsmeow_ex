@@ -278,7 +278,6 @@ defmodule Whatsmeow.Signal.Decrypt do
 
   defp group_sender_id(%MessageInfo{participant: %JID{} = p}), do: JID.to_string(p)
   defp group_sender_id(%MessageInfo{from: %JID{} = j}), do: JID.to_string(j)
-  defp group_sender_id(_), do: nil
 
   # --- SenderKeyDistributionMessage seeding (called after pkmsg/msg) ------
 

@@ -106,7 +106,11 @@ defmodule Whatsmeow.Send.Group do
 
   defp run_send(server, %Device{} = device, %JID{} = group_jid, devices, text, opts) do
     group_id_str = JID.to_string(group_jid)
-    sender_id = JID.to_string(device.jid)
+    # `Device.jid` is already a string — it is the schema's primary key. Running
+    # it back through `JID.to_string/1`, which only has a `%JID{}` clause, raised
+    # FunctionClauseError on every group send. Nothing caught it because the
+    # tests for this module stop at input validation and never reach here.
+    sender_id = device.jid
     sender_key_id = Keyword.get(opts, :registration_id, device.registration_id || 0)
 
     body_plaintext = Send.build_e2e_text_message(text)
