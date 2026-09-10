@@ -11,6 +11,36 @@ defmodule Whatsmeow.Store.Postgres do
   alias Whatsmeow.Repo
   alias Whatsmeow.Store.Schemas
 
+  # One peer, one session key.
+  #
+  # A contact reaches us as a LID (`182909923287057@lid`) and we send to them
+  # as a phone number (`201141465543@s.whatsapp.net`). Those are two strings
+  # for one physical device, and keying the session store on the string as it
+  # arrives gives that device **two Signal ratchets**: inbound advances the
+  # LID one, outbound advances the PN one, and the peer — which has exactly
+  # one session — sees the counters diverge and can no longer decrypt.
+  #
+  # The symptom is "waiting for this message" on the recipient's phone,
+  # intermittently, worst on whichever device they type on most, and cured by
+  # re-pairing only until the first inbound message splits the pair again.
+  # Proof: identical identity keys under both forms, per device.
+  #
+  #     182909923287057@lid          C14880FFA1E1990F
+  #     201141465543@s.whatsapp.net  C14880FFA1E1990F
+  #
+  # Everything is stored under the phone-number form, because that is what
+  # `get_user_devices/3` returns and what outbound addresses. An unmapped LID
+  # is left as it is: no worse than before, and it converges as soon as the
+  # mapping arrives.
+  defp canonical(their_id) do
+    case Whatsmeow.LIDMap.resolve(their_id) do
+      %Whatsmeow.Types.JID{} = jid -> Whatsmeow.Types.JID.to_string(jid)
+      _ -> their_id
+    end
+  rescue
+    _ -> their_id
+  end
+
   @impl true
   def new_device(opts) do
     # Construction (including the clamping and XEdDSA subtleties) lives in
@@ -162,7 +192,9 @@ defmodule Whatsmeow.Store.Postgres do
   end
 
   @impl true
-  def put_identity(our_jid, their_id, identity) do
+  def put_identity(our_jid, their_id_raw, identity) do
+    their_id = canonical(their_id_raw)
+
     %Schemas.IdentityKey{}
     |> Schemas.IdentityKey.changeset(%{
       our_jid: our_jid,
@@ -180,7 +212,9 @@ defmodule Whatsmeow.Store.Postgres do
   end
 
   @impl true
-  def get_identity(our_jid, their_id) do
+  def get_identity(our_jid, their_id_raw) do
+    their_id = canonical(their_id_raw)
+
     case Repo.get_by(Schemas.IdentityKey, our_jid: our_jid, their_id: their_id) do
       nil -> {:error, :not_found}
       rec -> {:ok, rec.identity}
@@ -188,7 +222,9 @@ defmodule Whatsmeow.Store.Postgres do
   end
 
   @impl true
-  def put_session(our_jid, their_id, session) do
+  def put_session(our_jid, their_id_raw, session) do
+    their_id = canonical(their_id_raw)
+
     %Schemas.Session{}
     |> Schemas.Session.changeset(%{our_jid: our_jid, their_id: their_id, session: session})
     |> Repo.insert(
@@ -202,7 +238,9 @@ defmodule Whatsmeow.Store.Postgres do
   end
 
   @impl true
-  def get_session(our_jid, their_id) do
+  def get_session(our_jid, their_id_raw) do
+    their_id = canonical(their_id_raw)
+
     case Repo.get_by(Schemas.Session, our_jid: our_jid, their_id: their_id) do
       nil -> {:error, :not_found}
       rec -> {:ok, rec.session}
