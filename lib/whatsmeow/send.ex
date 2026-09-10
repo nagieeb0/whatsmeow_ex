@@ -1148,16 +1148,27 @@ defmodule Whatsmeow.Send do
     # transaction would pin a pool connection per fanout worker. There is no
     # read-modify-write to protect there anyway: the session is created, not
     # mutated.
+    # `:force_new_session` skips the load entirely, so the branch below runs
+    # X3DH and a fresh ratchet replaces the wedged one. That is the whole
+    # answer to a retry receipt: the peer is telling us its half of this
+    # session cannot open our envelopes, and re-encrypting under the same
+    # session produces another envelope it cannot open. Nothing is deleted —
+    # the new session is persisted over the old one by the same write the
+    # first-contact path already does.
     locked =
-      Lock.with_session(device.jid, their_id, fn ->
-        case load_session_and_identity(device.jid, their_id, their_id_pub_override) do
-          {:ok, sess, their_id_pub} ->
-            encrypt_with_existing_session(device, their_id, sess, their_id_pub, plaintext)
+      if Keyword.get(opts, :force_new_session, false) do
+        :no_session
+      else
+        Lock.with_session(device.jid, their_id, fn ->
+          case load_session_and_identity(device.jid, their_id, their_id_pub_override) do
+            {:ok, sess, their_id_pub} ->
+              encrypt_with_existing_session(device, their_id, sess, their_id_pub, plaintext)
 
-          :no_session ->
-            :no_session
-        end
-      end)
+            :no_session ->
+              :no_session
+          end
+        end)
+      end
 
     case locked do
       :no_session ->
@@ -1285,4 +1296,96 @@ defmodule Whatsmeow.Send do
     Logger.warning("[whatsmeow] dm fanout: task crashed: #{inspect(reason)}")
     acc
   end
+  # --- answering a retry receipt ---------------------------------------
+
+  @doc """
+  Answer a `<receipt type="retry">` — the peer could not decrypt something.
+
+  ## The failure this closes
+
+  `whatsmeow_ex` *sends* retry receipts when it cannot decrypt an inbound
+  message, and did nothing at all when it received one. So a recipient whose
+  Signal session had diverged sat on **"في انتظار هذه الرسالة"** forever,
+  while the sender held a delivery receipt and every screen said the message
+  had landed.
+
+  Measured on a live install: one reply, three of the recipient's devices.
+  The laptop opened it and read it. The phone asked for a retry twice, was
+  never answered, and the person never saw a word of it.
+
+  ## Why re-sending the same message does not work
+
+  It was tried, in the application above this library, and removed: encryption
+  is per device, so an ordinary re-send fans out to every device and
+  re-encrypts under the *same* wedged session. The laptop showed the sentence
+  three times and the phone still could not read any of them.
+
+  So this does the two things that actually matter, which an ordinary send
+  cannot do:
+
+    * `force_new_session: true` — the peer is telling us its half of this
+      session cannot open our envelopes. A fresh X3DH exchange replaces the
+      ratchet; re-encrypting under the old one produces another envelope it
+      cannot open.
+    * **one device**, the one that asked. Every other device already read it.
+
+  Mirrors Go's `handleRetryReceipt` (`whatsmeow-main/retry.go`).
+  """
+  def answer_retry(server, %Device{} = device, device_id, %JID{} = from, msg_id) do
+    case Whatsmeow.Retry.RecentCache.get(JID.to_string(JID.to_non_ad(from)), msg_id) do
+      :not_found ->
+        Logger.warning(
+          "[whatsmeow] retry receipt for an unknown or expired message id=#{msg_id}",
+          device_id: device_id
+        )
+
+        {:error, :unknown_message}
+
+      {:ok, %{to_jid: peer, plaintext: plaintext, msg_type: msg_type}} ->
+        peer_jid = parse_peer(peer, from)
+        resend_to_device(server, device, from, peer_jid, plaintext, msg_type, msg_id)
+    end
+  end
+
+
+  # The cache stores the JID as a string; everything downstream wants a
+  # struct. Falls back to the retrying device's own bare JID, which is the
+  # same conversation by definition.
+  defp parse_peer(peer, %JID{} = from) do
+    case JID.parse(peer) do
+      {:ok, %JID{} = jid} -> jid
+      _ -> %{from | device: nil, agent: nil}
+    end
+  rescue
+    _ -> from
+  end
+  defp resend_to_device(server, device, from, peer_jid, plaintext, msg_type, msg_id) do
+    Logger.info(
+      "[whatsmeow] answering a retry receipt id=#{msg_id} device=#{JID.to_string(from)}",
+      device_id: device.jid
+    )
+
+    case encrypt_plaintext_for_peer(server, device, from, plaintext, force_new_session: true) do
+      {:ok, envelope, enc_type, _sess} ->
+        node =
+          build_dm_message_node(
+            peer_jid,
+            msg_id,
+            [build_participant_node(from, envelope, enc_type)],
+            device,
+            enc_type == "pkmsg",
+            msg_type
+          )
+
+        Session.send_node(server, attach_tctoken(node, device.jid, peer_jid))
+
+      other ->
+        Logger.warning("[whatsmeow] could not re-encrypt for a retry: #{inspect(other)}",
+          device_id: device.jid
+        )
+
+        {:error, other}
+    end
+  end
+
 end

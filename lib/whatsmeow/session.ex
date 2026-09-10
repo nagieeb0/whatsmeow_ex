@@ -83,6 +83,11 @@ defmodule Whatsmeow.Session do
   # Sweep cadence — every hour.
   @retry_count_sweep_ms 3_600_000
 
+  # How many times we will answer a retry for one message id. The peer
+  # decides how often to ask; this decides how often we pay a prekey fetch
+  # for an answer that is evidently not landing.
+  @retry_answer_cap 3
+
   defstruct [
     :device_id,
     :device,
@@ -946,6 +951,19 @@ defmodule Whatsmeow.Session do
       Whatsmeow.Notifications.broadcast(state.device_id, receipt)
     end
 
+    # A retry receipt is not information, it is a request, and this library
+    # answered it for a long time by broadcasting it and moving on.
+    #
+    # `<receipt type="retry">` means one of the recipient's devices could not
+    # decrypt something we sent. Their screen says "في انتظار هذه الرسالة" and
+    # ours says delivered. Measured live: one reply, three of the recipient's
+    # devices — the laptop opened and read it, the phone asked twice, was never
+    # answered, and the person never saw a word of it.
+    #
+    # See `Whatsmeow.Send.answer_retry/5` for why an ordinary re-send is the
+    # wrong answer and what this does instead.
+    state = maybe_answer_retry(state, receipt)
+
     ack = Whatsmeow.Receipt.build_ack(node)
     {:ok, state2} = do_send_node(state, ack) |> ok_or_keep(state)
     state2
@@ -1587,7 +1605,7 @@ defmodule Whatsmeow.Session do
 
   defp bump_retry_count(nil), do: 1
 
-  defp bump_retry_count(msg_id) when is_binary(msg_id) do
+  defp bump_retry_count(msg_id) when is_binary(msg_id) or is_tuple(msg_id) do
     ensure_retry_table()
     now = System.system_time(:second)
     count = :ets.update_counter(@retry_count_table, msg_id, {2, 1}, {msg_id, 0, now})
@@ -2097,6 +2115,48 @@ defmodule Whatsmeow.Session do
         state
     end
   end
+
+  # Answering a retry receipt, off this process.
+  #
+  # `Send.answer_retry/5` fetches a prekey bundle, which is an IQ round trip,
+  # which is a `GenServer.call` back into **this** process. Called inline it
+  # deadlocks the session on the first retry receipt it ever sees — every
+  # clinic's socket wedged by the one code path added to un-wedge them. So it
+  # runs on the same task supervisor the post-login prekey upload uses, for
+  # the same reason.
+  #
+  # Bounded by `@retry_answer_cap`: the peer decides how many times to ask,
+  # and a device that cannot open anything would otherwise have us fetching a
+  # fresh bundle and re-encrypting for ever. Go caps this too
+  # (`whatsmeow-main/retry.go`).
+  #
+  # Never at the cost of the ack — a raise here would leave the stanza
+  # unacknowledged and the server would replay it for ever, which is the
+  # failure this whole area is about.
+  defp maybe_answer_retry(state, %{type: :retry, message_ids: ids, from: %{} = from})
+       when is_list(ids) do
+    server = self()
+
+    for msg_id <- ids, is_binary(msg_id), bump_retry_count({:answered, msg_id}) <= @retry_answer_cap do
+      device = state.device
+      device_id = state.device_id
+
+      Task.Supervisor.start_child(Whatsmeow.Media.TaskSup, fn ->
+        Whatsmeow.Send.answer_retry(server, device, device_id, from, msg_id)
+      end)
+    end
+
+    state
+  rescue
+    error ->
+      Logger.warning("[whatsmeow] could not answer a retry receipt: #{inspect(error)}",
+        device_id: state.device_id
+      )
+
+      state
+  end
+
+  defp maybe_answer_retry(state, _receipt), do: state
 
   # Walk an `<ib>` info-broadcast and dispatch typed events for the
   # children we recognise. Upstream Go (`connectionevents.go::handleIB`)
