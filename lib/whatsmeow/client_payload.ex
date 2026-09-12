@@ -66,11 +66,22 @@ defmodule Whatsmeow.ClientPayload do
   @spec persona_for(Device.t() | map() | nil) :: Persona.t()
   def persona_for(device), do: Persona.for_device(device)
 
-  # A paired device has a real WA JID like "1234567890:1@s.whatsapp.net" or
-  # "1234567890@s.whatsapp.net". Anything without an "@" (placeholder JIDs
-  # like "smoke-…", "device-…", or "") is unpaired and must use the
-  # registration payload.
-  defp paired?(jid) when is_binary(jid) do
+  @doc """
+  Has this device been linked to a WhatsApp account?
+
+  A paired device has a real WA JID like `"1234567890:1@s.whatsapp.net"` or
+  `"1234567890@s.whatsapp.net"`. Anything without an `"@"` — placeholder JIDs
+  like `"smoke-…"`, `"device-…"`, or `""` — is unpaired and must use the
+  registration payload.
+
+  Public because `Whatsmeow.Session` gates its own auto-dial on the same
+  question, and the two answers must never diverge: a device we would send a
+  login payload for is exactly the device we should reconnect on boot, and one
+  we would send a registration payload for must never dial itself — that would
+  open a pairing socket on every restart.
+  """
+  @spec paired?(String.t() | term()) :: boolean()
+  def paired?(jid) when is_binary(jid) do
     case String.split(jid, "@", parts: 2) do
       [user_part, server] when server != "" ->
         user_part
@@ -83,7 +94,7 @@ defmodule Whatsmeow.ClientPayload do
     end
   end
 
-  defp paired?(_), do: false
+  def paired?(_), do: false
 
   defp numeric?(<<>>), do: false
   defp numeric?(s) when is_binary(s), do: String.match?(s, ~r/^\d+$/)

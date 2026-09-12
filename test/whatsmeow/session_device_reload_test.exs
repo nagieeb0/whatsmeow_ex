@@ -80,7 +80,8 @@ defmodule Whatsmeow.SessionDeviceReloadTest do
 
   test "a restart reloads the paired device by client_id, discarding the stale snapshot" do
     with_store(PairedStore, fn ->
-      {:ok, state} = Session.init(device_id: @client_id, device: stale_snapshot())
+      {:ok, state, {:continue, :connect}} =
+        Session.init(device_id: @client_id, device: stale_snapshot())
 
       assert state.device.jid == @paired_jid,
              "restarted from the child spec's pre-pairing snapshot — this is the " <>
@@ -95,7 +96,9 @@ defmodule Whatsmeow.SessionDeviceReloadTest do
     # `Whatsmeow.start_session/2`'s `session_key/1` falls back to `:jid`, so a
     # host that supplies no client_id still gets the reload.
     with_store(PairedStore, fn ->
-      {:ok, state} = Session.init(device_id: @paired_jid, device: stale_snapshot())
+      {:ok, state, {:continue, :connect}} =
+        Session.init(device_id: @paired_jid, device: stale_snapshot())
+
       assert state.device.jid == @paired_jid
     end)
   end
@@ -120,11 +123,47 @@ defmodule Whatsmeow.SessionDeviceReloadTest do
     end)
   end
 
-  test "starts idle and not connected, whichever device it ended up with" do
-    with_store(PairedStore, fn ->
-      {:ok, state} = Session.init(device_id: @client_id, device: stale_snapshot())
-      assert state.status == :idle
-      assert state.reconnect_attempts == 0
-    end)
+  # A paired device dials itself, and an unpaired one must not.
+  #
+  # The second half is the one with teeth. This process is `:permanent`, so it
+  # is restarted after every crash; if an unpaired device auto-dialled, every
+  # boot would open a pairing socket for every clinic that has not got round to
+  # pairing, forever.
+  describe "dialing on boot" do
+    test "a paired device asks to connect, and starts idle until it does" do
+      with_store(PairedStore, fn ->
+        {:ok, state, {:continue, :connect}} =
+          Session.init(device_id: @client_id, device: stale_snapshot())
+
+        assert state.status == :idle
+        assert state.reconnect_attempts == 0
+        assert state.failure_retries == 0
+      end)
+    end
+
+    test "an unpaired device does not dial" do
+      with_store(EmptyStore, fn ->
+        assert {:ok, %{status: :idle}} =
+                 Session.init(device_id: @client_id, device: stale_snapshot())
+      end)
+    end
+
+    test "offline mode never dials, paired or not" do
+      with_store(PairedStore, fn ->
+        assert {:ok, %{offline?: true}} =
+                 Session.init(device_id: @client_id, device: stale_snapshot(), offline?: true)
+      end)
+    end
+
+    test "a session started with auto_reconnect? false never dials" do
+      with_store(PairedStore, fn ->
+        assert {:ok, %{auto_reconnect?: false}} =
+                 Session.init(
+                   device_id: @client_id,
+                   device: stale_snapshot(),
+                   auto_reconnect?: false
+                 )
+      end)
+    end
   end
 end

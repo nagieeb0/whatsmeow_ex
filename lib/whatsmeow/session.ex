@@ -58,6 +58,7 @@ defmodule Whatsmeow.Session do
   require Logger
 
   alias Whatsmeow.Binary
+  alias Whatsmeow.ConnectionEvents
   alias Whatsmeow.Crypto.Curve25519
   alias Whatsmeow.IQ
   alias Whatsmeow.Login
@@ -75,6 +76,12 @@ defmodule Whatsmeow.Session do
   # Backoff: 1s, 2s, 4s, … capped.
   @reconnect_initial_ms 1_000
   @reconnect_max_ms 300_000
+
+  # How many times a *retryable* `<failure>` may be answered with a reconnect
+  # before we stop and say so. At the 5-minute backoff cap this is roughly half
+  # an hour of trying — long enough to ride out a rate limit or a WhatsApp
+  # deploy, short enough that a genuinely dead device stops knocking.
+  @failure_retry_cap 10
 
   # Per-message-id retry counter ETS table. See `bump_retry_count/1`.
   @retry_count_table :whatsmeow_message_retries
@@ -121,6 +128,16 @@ defmodule Whatsmeow.Session do
     # their bot's receive→reply path without a WhatsApp connection — see
     # `Whatsmeow.Testing`. Always false in normal operation.
     offline?: false,
+    # Failure-originated reconnect attempts, counted separately from
+    # `reconnect_attempts` and reset only by a real `<success>`.
+    #
+    # They cannot share a counter. `reconnect_attempts` is zeroed the moment the
+    # Noise handshake completes (`do_connect/1`), and a `<failure>` arrives
+    # *after* that — it is an application-layer refusal on a socket that
+    # connected fine. Reusing it would reset the backoff on every attempt and
+    # turn a retryable failure into a one-second hammer loop against WhatsApp,
+    # which is the ban shape this file is otherwise careful to avoid.
+    failure_retries: 0,
     sent: [],
     pending: %{}
   ]
@@ -185,6 +202,17 @@ defmodule Whatsmeow.Session do
   @doc "Initiate a connect attempt. Will trigger the Noise handshake."
   @spec connect(pid() | String.t()) :: :ok
   def connect(server), do: GenServer.cast(via_or_pid(server), :connect)
+
+  @doc """
+  Drop the socket and dial again, even if the session believes it is connected.
+
+  For a caller holding evidence the session is wrong — a watchdog whose round
+  trip timed out, say. `connect/1` is idempotent and ignores a request while
+  the status is `:connected`/`:authenticated`, which is correct for a racing
+  UI click and useless against a wedged socket.
+  """
+  @spec force_reconnect(pid() | String.t()) :: :ok
+  def force_reconnect(server), do: GenServer.cast(via_or_pid(server), :force_reconnect)
 
   @doc "Synchronous snapshot of the session's status + bookkeeping. Cheap; use freely in tests/dashboards."
   @spec info(pid() | String.t()) :: %{
@@ -350,19 +378,49 @@ defmodule Whatsmeow.Session do
     ensure_retry_table()
     Process.send_after(self(), :retry_count_sweep, @retry_count_sweep_ms)
 
-    {:ok,
-     %__MODULE__{
-       device_id: device_id,
-       device: device,
-       transport: transport,
-       transport_opts: transport_opts,
-       status: :idle,
-       reconnect_attempts: 0,
-       keepalive_failures: 0,
-       auto_reconnect?: auto_reconnect?,
-       offline?: offline?
-     }}
+    state = %__MODULE__{
+      device_id: device_id,
+      device: device,
+      transport: transport,
+      transport_opts: transport_opts,
+      status: :idle,
+      reconnect_attempts: 0,
+      keepalive_failures: 0,
+      auto_reconnect?: auto_reconnect?,
+      offline?: offline?
+    }
+
+    # Dial ourselves, instead of waiting for somebody to remember to.
+    #
+    # This process is `:permanent` under a DynamicSupervisor, so it is restarted
+    # after every crash — and after `on_failure/2`'s deliberate `{:stop, :normal}`.
+    # The restarted process used to land here at `:idle` and simply sit there:
+    # the host application casts `:connect` exactly once, at boot, and nothing
+    # re-runs that. So the second crash of the day left a paired number silently
+    # off the air, with no log line and no event — its only signature the
+    # *absence* of "connecting". The operator's screen showed a healthy pairing
+    # and the only button under it unlinked the device.
+    #
+    # Gated on the same question `ClientPayload.build/1` asks, deliberately: a
+    # device we would send a login payload for is one we should dial, and a
+    # device we would send a *registration* payload for must never dial itself —
+    # that opens a pairing socket on every boot for every clinic that has not
+    # got round to pairing yet. `Whatsmeow.Pairing`-style flows still connect
+    # explicitly, and `handle_cast(:connect, …)` is idempotent.
+    if dial_on_boot?(state) do
+      {:ok, state, {:continue, :connect}}
+    else
+      {:ok, state}
+    end
   end
+
+  defp dial_on_boot?(%__MODULE__{offline?: true}), do: false
+  defp dial_on_boot?(%__MODULE__{auto_reconnect?: false}), do: false
+  defp dial_on_boot?(%__MODULE__{device: %{jid: jid}}), do: Whatsmeow.ClientPayload.paired?(jid)
+  defp dial_on_boot?(_state), do: false
+
+  @impl GenServer
+  def handle_continue(:connect, state), do: handle_cast(:connect, state)
 
   # Re-read the device from the store instead of trusting the one in `opts`.
   #
@@ -552,6 +610,24 @@ defmodule Whatsmeow.Session do
     {:noreply, state}
   end
 
+  # Tear the socket down first, then dial. For the caller who has *evidence*
+  # that a session reporting `:connected` is not.
+  #
+  # `:connect` is deliberately idempotent, which makes it useless to a watchdog:
+  # a session wedged at `:authenticated` on a socket that stopped answering is
+  # exactly the case the watchdog exists to repair, and its `connect/1` was
+  # being dropped by the clause above as a debug line. The one repair it had was
+  # a no-op on the one failure it could detect.
+  def handle_cast(:force_reconnect, %__MODULE__{status: status} = state)
+      when status in [:connecting, :handshaking, :connected, :authenticated] do
+    Logger.warning("[whatsmeow] forced reconnect while #{status}", device_id: state.device_id)
+
+    {:noreply, handle_disconnect(state, :forced)}
+  end
+
+  # Not up in the first place: an ordinary dial.
+  def handle_cast(:force_reconnect, %__MODULE__{} = state), do: handle_cast(:connect, state)
+
   def handle_cast(:connect, %__MODULE__{status: :idle} = state) do
     case cold_start_jitter_ms() do
       0 ->
@@ -686,17 +762,24 @@ defmodule Whatsmeow.Session do
 
   def handle_info(:keepalive_tick, %__MODULE__{status: status} = state)
       when status in [:connected, :authenticated, :pairing] do
-    case send_keepalive(state) do
-      {:ok, state2} ->
-        {:noreply, schedule_keepalive(state2)}
+    state = note_unanswered_keepalive(state)
 
-      {:error, reason} ->
-        Logger.warning("[whatsmeow] keepalive send failed",
-          device_id: state.device_id,
-          reason: inspect(reason)
-        )
+    # `bump_keepalive_failure/1` may have just torn the socket down.
+    if state.status in [:connected, :authenticated, :pairing] do
+      case send_keepalive(state) do
+        {:ok, state2} ->
+          {:noreply, schedule_keepalive(state2)}
 
-        {:noreply, schedule_keepalive(bump_keepalive_failure(state))}
+        {:error, reason} ->
+          Logger.warning("[whatsmeow] keepalive send failed",
+            device_id: state.device_id,
+            reason: inspect(reason)
+          )
+
+          {:noreply, schedule_keepalive(bump_keepalive_failure(state))}
+      end
+    else
+      {:noreply, state}
     end
   end
 
@@ -1936,6 +2019,9 @@ defmodule Whatsmeow.Session do
         state
         |> Map.put(:status, :authenticated)
         |> Map.put(:keepalive_failures, 0)
+        # Authenticated, not merely connected — the only evidence that whatever
+        # the server was refusing has stopped.
+        |> Map.put(:failure_retries, 0)
         |> schedule_keepalive()
 
       {:error, reason} ->
@@ -1950,24 +2036,81 @@ defmodule Whatsmeow.Session do
     end
   end
 
+  # Not every `<failure>` means the device was unlinked.
+  #
+  # This used to treat all of them as terminal: clear `auto_reconnect?`, stop.
+  # The process is `:permanent`, so it restarted immediately and sat at `:idle`
+  # dialing nothing — a paired number silently off the air with no log line and
+  # no event, until a human re-scanned a QR it never needed. A rate limit and a
+  # stale client version are transient; only a refused identity is not.
+  #
+  # The classifier already existed, written and doctested, and nothing called
+  # it: `Whatsmeow.ConnectionEvents.decode_failure/1`.
   defp on_failure(state, node) do
-    code = Binary.Node.attr(node, "code")
-    reason = Binary.Node.attr(node, "reason")
+    {reason, message, extras} = ConnectionEvents.decode_failure(node)
 
     Logger.warning(
-      "[whatsmeow] <failure> code=#{inspect(code)} reason=#{inspect(reason)} attrs=#{inspect(node.attrs)}",
+      "[whatsmeow] <failure> reason=#{inspect(reason)} message=#{inspect(message)} " <>
+        "extras=#{inspect(extras)} attrs=#{inspect(node.attrs)}",
       device_id: state.device_id
     )
 
+    case failure_policy(reason) do
+      :terminal ->
+        broadcast_logged_out(state, reason)
+        %{state | auto_reconnect?: false, status: :stopping}
+
+      :refresh_version ->
+        # 405 is "your client build is too old", and the cure is already in this
+        # file — it was simply wired to `<stream:error code=500>` instead, which
+        # is `:internal_server_error`. So the one failure with a known automatic
+        # fix was the one that never got it.
+        trigger_wa_version_refresh_async(state.device_id)
+        retry_after_failure(state, reason)
+
+      :retry ->
+        retry_after_failure(state, reason)
+    end
+  end
+
+  # 401/403/406 — the identity itself is refused. Retrying is re-authenticating a
+  # deleted device in a loop, which is how a number gets banned rather than
+  # restored. 4264 is a ban already in progress; hammering it is strictly worse.
+  defp failure_policy(:logged_out), do: :terminal
+  defp failure_policy(:temp_banned), do: :terminal
+  defp failure_policy(:client_outdated), do: :refresh_version
+  defp failure_policy(_transient), do: :retry
+
+  defp retry_after_failure(state, reason) do
+    attempts = state.failure_retries + 1
+
+    if attempts > @failure_retry_cap do
+      # Give up, but give up *loudly*. Dying quietly is the bug this whole
+      # change is about: the screen said "paired" and the only button under it
+      # deleted the identity.
+      Logger.error(
+        "[whatsmeow] giving up after #{attempts - 1} reconnects against " <>
+          "<failure reason=#{inspect(reason)}>",
+        device_id: state.device_id
+      )
+
+      broadcast_logged_out(state, reason)
+      %{state | auto_reconnect?: false, status: :stopping}
+    else
+      # Through the ordinary disconnect path, so the existing exponential
+      # backoff (1s → 5min cap, with jitter) applies unchanged. At the cap this
+      # is twelve handshakes an hour — less traffic than the keepalive.
+      %{state | failure_retries: attempts}
+      |> handle_disconnect({:failure, reason})
+    end
+  end
+
+  defp broadcast_logged_out(state, reason) do
     Whatsmeow.Notifications.broadcast(state.device_id, %Events.LoggedOut{
       device_id: state.device_id,
       on_connect: state.status in [:connecting, :handshaking, :connected],
-      reason: failure_reason_atom(reason)
+      reason: reason
     })
-
-    # <failure> is terminal — clear auto_reconnect so we don't loop into a
-    # ban condition.
-    %{state | auto_reconnect?: false, status: :stopping}
   end
 
   defp on_stream_error(state, node) do
@@ -2008,7 +2151,7 @@ defmodule Whatsmeow.Session do
   defp trigger_wa_version_refresh_async(device_id) do
     Task.Supervisor.start_child(Whatsmeow.Media.TaskSup, fn ->
       Logger.warning(
-        "[whatsmeow] <stream:error code=500> — forcing WAVersion.refresh/1 (client-outdated auto-recovery)",
+        "[whatsmeow] forcing WAVersion.refresh/1 (client-outdated auto-recovery)",
         device_id: device_id
       )
 
@@ -2232,6 +2375,32 @@ defmodule Whatsmeow.Session do
     case do_send_node(state, iq) do
       {:ok, state2} -> {:ok, %{state2 | pending: Map.put(state2.pending, id, :keepalive)}}
       err -> err
+    end
+  end
+
+  # A ping the server never answered.
+  #
+  # The moduledoc has promised this check since before it existed: three
+  # consecutive un-acked pings force a reconnect. What was implemented counted
+  # only failures of the *send*, and a send into a dead-but-open socket
+  # succeeds — the kernel takes the bytes whether or not WhatsApp is still
+  # listening. So a session could sit at `:authenticated` indefinitely,
+  # reporting healthy to every screen we own while answering nobody, and the
+  # watchdog's repair was dropped as a no-op because the status looked fine.
+  #
+  # `on_iq_response/2` pops the id and zeroes the counter when a ping comes
+  # back, so an id still in `pending` one tick later was never answered. Forget
+  # it either way: one miss, one count.
+  defp note_unanswered_keepalive(state) do
+    case Enum.find(state.pending, fn {_id, tag} -> tag == :keepalive end) do
+      nil ->
+        state
+
+      {id, _tag} ->
+        Logger.warning("[whatsmeow] keepalive went unanswered", device_id: state.device_id)
+
+        %{state | pending: Map.delete(state.pending, id)}
+        |> bump_keepalive_failure()
     end
   end
 
@@ -2463,13 +2632,6 @@ defmodule Whatsmeow.Session do
   defp pair_error_text(:missing_account_signature_key), do: "signature-mismatch"
   defp pair_error_text(_), do: "internal-error"
 
-  defp failure_reason_atom("401"), do: :unauthorized
-  defp failure_reason_atom("403"), do: :forbidden
-  defp failure_reason_atom("405"), do: :not_allowed
-  defp failure_reason_atom("503"), do: :service_unavailable
-  defp failure_reason_atom(other) when is_binary(other), do: :failure
-  defp failure_reason_atom(_), do: :failure
-
   defp via(device_id), do: {:via, Registry, {Whatsmeow.Sessions.Registry, device_id}}
 
   defp via_or_pid(pid) when is_pid(pid), do: pid
@@ -2482,9 +2644,6 @@ defmodule Whatsmeow.Session do
   # routing logic without standing up a full mock transport. Production
   # callers go through `handle_info/2`.
   def __dispatch_node__(state, %Binary.Node{} = node), do: dispatch_node(state, node)
-
-  @doc false
-  def __failure_reason_atom__(reason), do: failure_reason_atom(reason)
 
   @doc false
   def __backoff_ms__(attempt), do: backoff_ms(attempt)

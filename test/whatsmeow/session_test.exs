@@ -25,20 +25,9 @@ defmodule Whatsmeow.SessionTest do
     }
   end
 
-  describe "__failure_reason_atom__/1" do
-    test "maps known WhatsApp failure codes to typed atoms" do
-      assert Session.__failure_reason_atom__("401") == :unauthorized
-      assert Session.__failure_reason_atom__("403") == :forbidden
-      assert Session.__failure_reason_atom__("405") == :not_allowed
-      assert Session.__failure_reason_atom__("503") == :service_unavailable
-    end
-
-    test "unknown reasons collapse to :failure (no atom-exhaustion path)" do
-      assert Session.__failure_reason_atom__("999") == :failure
-      assert Session.__failure_reason_atom__("anything-here") == :failure
-      assert Session.__failure_reason_atom__(nil) == :failure
-    end
-  end
+  # The failure vocabulary now lives in `Whatsmeow.ConnectionEvents`, which is
+  # doctested there. `Session.__failure_reason_atom__/1` was a second, competing
+  # answer to "what does this failure mean" and is gone.
 
   describe "__backoff_ms__/1 (reconnect schedule)" do
     test "doubles each attempt (with up to +500 ms jitter)" do
@@ -98,14 +87,64 @@ defmodule Whatsmeow.SessionTest do
       %{device_id: device_id}
     end
 
-    test "broadcasts LoggedOut with typed reason + disables auto_reconnect", ctx do
+    test "401 is terminal: the identity itself was refused", ctx do
       node = Node.new("failure", %{"reason" => "401"})
 
       state = base_state(ctx.device_id) |> Session.__dispatch_node__(node)
 
       refute state.auto_reconnect?
       assert state.status == :stopping
-      assert_receive {:whatsmeow, %Events.LoggedOut{reason: :unauthorized}}, 200
+      assert_receive {:whatsmeow, %Events.LoggedOut{reason: :logged_out}}, 200
+    end
+
+    # The regression this whole change is about. `<failure>` used to be
+    # uniformly terminal, so a rate limit killed the session as thoroughly as an
+    # unlinked device — and because the process is `:permanent`, it restarted at
+    # `:idle`, dialing nothing, logging nothing. A paired number silently off the
+    # air until somebody re-scanned a QR it never needed.
+    test "503 retries instead of dying", ctx do
+      node = Node.new("failure", %{"reason" => "503"})
+
+      state = base_state(ctx.device_id) |> Session.__dispatch_node__(node)
+
+      assert state.auto_reconnect?, "a rate limit is not an unlinked device"
+      assert state.status == :disconnected
+      assert state.failure_retries == 1
+      refute_receive {:whatsmeow, %Events.LoggedOut{}}, 100
+    end
+
+    test "405 refreshes the client version and retries", ctx do
+      node = Node.new("failure", %{"reason" => "405"})
+
+      state = base_state(ctx.device_id) |> Session.__dispatch_node__(node)
+
+      assert state.auto_reconnect?
+      assert state.failure_retries == 1
+    end
+
+    # A ban in progress. Reconnecting into it is how a temporary ban becomes a
+    # permanent one.
+    test "a temporary ban is terminal", ctx do
+      node = Node.new("failure", %{"reason" => "4264"})
+
+      state = base_state(ctx.device_id) |> Session.__dispatch_node__(node)
+
+      refute state.auto_reconnect?
+      assert state.status == :stopping
+      assert_receive {:whatsmeow, %Events.LoggedOut{reason: :temp_banned}}, 200
+    end
+
+    test "retries are bounded, and giving up says so", ctx do
+      node = Node.new("failure", %{"reason" => "503"})
+
+      state =
+        Enum.reduce(1..11, base_state(ctx.device_id), fn _, acc ->
+          Session.__dispatch_node__(acc, node)
+        end)
+
+      refute state.auto_reconnect?, "must stop knocking eventually"
+      assert state.status == :stopping
+      assert_receive {:whatsmeow, %Events.LoggedOut{reason: :service_unavailable}}, 200
     end
   end
 
@@ -286,6 +325,79 @@ defmodule Whatsmeow.SessionTest do
       after
         Application.put_env(:whatsmeow_ex, :cold_start_jitter_ms, prev)
       end
+    end
+  end
+
+  # A socket can stay open and writable long after the other end has stopped
+  # listening. `send/2` succeeding proves the kernel took the bytes, not that
+  # WhatsApp did — so counting only send failures let a session sit at
+  # `:authenticated` for ever, reporting healthy to every screen while answering
+  # nobody. The watchdog's repair was then dropped as a no-op, because the
+  # status looked fine.
+  describe "keepalive" do
+    setup do
+      device_id = "sess-test-#{System.unique_integer([:positive])}"
+      :ok = Whatsmeow.Notifications.subscribe(device_id)
+      on_exit(fn -> Whatsmeow.Notifications.unsubscribe(device_id) end)
+      %{device_id: device_id}
+    end
+
+    test "an unanswered ping counts against the session", ctx do
+      state =
+        ctx.device_id
+        |> base_state(status: :authenticated, pending: %{"ka-1" => :keepalive})
+        |> Map.put(:keepalive_failures, 2)
+
+      {:noreply, state} = Session.handle_info(:keepalive_tick, state)
+
+      assert state.status == :disconnected,
+             "three unanswered pings must force a reconnect, as the moduledoc has always claimed"
+
+      assert_receive {:whatsmeow, %Events.Disconnected{reason: :keepalive_failed}}, 200
+    end
+
+    test "the missed ping is forgotten, so one miss is counted once", ctx do
+      state =
+        ctx.device_id
+        |> base_state(status: :authenticated, pending: %{"ka-1" => :keepalive})
+
+      {:noreply, state} = Session.handle_info(:keepalive_tick, state)
+
+      refute Enum.any?(state.pending, fn {_id, tag} -> tag == :keepalive end),
+             "a miss left in `pending` would be counted again on the next tick"
+    end
+
+    test "a session with nothing pending is not penalised", ctx do
+      state = base_state(ctx.device_id, status: :authenticated)
+
+      {:noreply, state} = Session.handle_info(:keepalive_tick, state)
+
+      # The send itself fails here (no transport_conn), which is a separate,
+      # already-tested path. What matters is that it was not charged twice.
+      assert state.keepalive_failures == 1
+    end
+  end
+
+  # `connect/1` is idempotent and ignores a request while the status says
+  # connected — correct for a racing UI click, useless to a watchdog holding
+  # evidence that the status is wrong.
+  describe "force_reconnect" do
+    test "tears down a session that believes it is connected" do
+      device_id = "sess-test-#{System.unique_integer([:positive])}"
+      state = base_state(device_id, status: :authenticated)
+
+      {:noreply, state} = Session.handle_cast(:force_reconnect, state)
+
+      assert state.status == :disconnected
+    end
+
+    test "plain connect leaves that same session alone" do
+      device_id = "sess-test-#{System.unique_integer([:positive])}"
+      state = base_state(device_id, status: :authenticated)
+
+      {:noreply, after_connect} = Session.handle_cast(:connect, state)
+
+      assert after_connect.status == :authenticated
     end
   end
 end
