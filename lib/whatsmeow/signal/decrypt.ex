@@ -23,10 +23,22 @@ defmodule Whatsmeow.Signal.Decrypt do
   started — unit tests don't run a Postgres so we keep this graceful.
   """
 
+  require Logger
+
   alias Whatsmeow.Binary.Node
   alias Whatsmeow.Crypto.Curve25519
   alias Whatsmeow.MessageInfo
-  alias Whatsmeow.Signal.{GroupDecrypt, GroupSession, Lock, SenderKeyWire, Wire, WireDecrypt}
+
+  alias Whatsmeow.Signal.{
+    Address,
+    GroupDecrypt,
+    GroupSession,
+    Lock,
+    SenderKeyWire,
+    Wire,
+    WireDecrypt
+  }
+
   alias Whatsmeow.Store.Schemas.Device
   alias Whatsmeow.Types.JID
 
@@ -118,7 +130,7 @@ defmodule Whatsmeow.Signal.Decrypt do
         # outbound stops wrapping as pkmsg and ships as bare msg.
         # Mirrors libsignal-java `SessionState.clearUnacknowledgedPreKeyMessage`.
         # `Map.put/3` — see WireDecrypt for the legacy-record reasoning.
-        _ = persist_session(device.jid, their_id, Map.put(session, :pending_pre_key, nil))
+        _ = persisted!(device.jid, their_id, Map.put(session, :pending_pre_key, nil))
 
         _ =
           stash_identity_pub(
@@ -185,7 +197,7 @@ defmodule Whatsmeow.Signal.Decrypt do
           # Mirrors libsignal-java
           # `SessionState.clearUnacknowledgedPreKeyMessage`.
           # `Map.put/3` — see WireDecrypt for the legacy-record reasoning.
-          _ = persist_session(device.jid, their_id, Map.put(new_sess, :pending_pre_key, nil))
+          _ = persisted!(device.jid, their_id, Map.put(new_sess, :pending_pre_key, nil))
           {:ok, %{plaintext: plain, enc_type: "msg", pkmsg: nil}}
 
         {:error, _} = err ->
@@ -213,6 +225,34 @@ defmodule Whatsmeow.Signal.Decrypt do
   def persist_session(our_jid, their_id, session),
     do: Whatsmeow.Signal.Store.Adapter.save_session(our_jid, their_id, session)
 
+  # Same write, but it says so when it fails.
+  #
+  # The send path can refuse to send when the ratchet will not persist. The
+  # receive path cannot: the message is already decrypted and handed upward,
+  # and there is no un-reading it. What it must not do is fail in silence —
+  # the receive chain has advanced in memory only, so the *next* inbound
+  # message decrypts against a stale stored chain and the conversation wedges
+  # with no record of why. This was a bare `_ =`.
+  defp persisted!(our_jid, their_id, session) do
+    case persist_session(our_jid, their_id, session) do
+      :ok ->
+        :ok
+
+      # The documented no-Repo mode. Nothing was meant to be stored.
+      {:error, :no_store} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.error(
+          "[whatsmeow] decrypted a message but could not persist the advanced " <>
+            "session for #{their_id}: #{inspect(reason)} — the next inbound message " <>
+            "from this device will fail to decrypt"
+        )
+
+        :error
+    end
+  end
+
   @doc """
   Persist (or replace) a peer's 32-byte identity public key.
 
@@ -234,11 +274,17 @@ defmodule Whatsmeow.Signal.Decrypt do
   defp load_identity_pub(our_jid, their_id),
     do: Whatsmeow.Signal.Store.Adapter.load_identity(our_jid, their_id)
 
-  # peer_id keys our persistence by the *full* JID string the message
-  # came `from=`. Group messages carry `participant=...`; we key by the
-  # individual sender there so the session matches the X3DH bundle.
-  defp peer_id(%MessageInfo{is_group?: true, participant: %JID{} = p}), do: JID.to_string(p)
-  defp peer_id(%MessageInfo{from: %JID{} = j}), do: JID.to_string(j)
+  # peer_id keys our persistence by the sender's *encryption identity*, not by
+  # the address the stanza happened to arrive from. The server volunteers a
+  # PN JID on some stanzas and the LID on others for the same device; keying
+  # on the raw value files one device under two records with two ratchets,
+  # and the peer then cannot decrypt anything we send on the other one. See
+  # `Whatsmeow.Signal.Address`.
+  #
+  # Group messages carry `participant=...`; we key by the individual sender
+  # there so the session matches the X3DH bundle.
+  defp peer_id(%MessageInfo{is_group?: true, participant: %JID{} = p}), do: Address.session_key(p)
+  defp peer_id(%MessageInfo{from: %JID{} = j}), do: Address.session_key(j)
   defp peer_id(_), do: ""
 
   # --- skmsg (group steady-state) -----------------------------------------

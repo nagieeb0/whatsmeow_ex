@@ -399,7 +399,22 @@ defmodule Whatsmeow.User do
   end
 
   defp fetch_user_devices(session, jids, opts) do
-    query = [Node.new("devices", %{"version" => "2"}, nil)]
+    # `<lid/>` alongside `<devices/>`, and not only in `get_user_info/3`.
+    #
+    # The send path files each peer's session under its encryption identity —
+    # the LID where one is known (`Whatsmeow.Signal.Address`) — and it can only
+    # do that for a peer already in `Whatsmeow.LIDMap`. This query is the one
+    # the fanout actually calls, and it used to ask for devices alone. So a
+    # contact nobody had looked up in full — every outreach target, every
+    # booking notification — had its first message encrypted under the phone
+    # number while the reply arrived under the LID, splitting the session into
+    # two ratchets and leaving the recipient's phone stuck on "waiting for this
+    # message". Upstream Go reads the mapping from this same device-list query
+    # (`whatsmeow-main/send.go:1285-1300`).
+    query = [
+      Node.new("devices", %{"version" => "2"}, nil),
+      Node.new("lid", %{}, nil)
+    ]
 
     with {:ok, list} <- usync(session, jids, "query", "message", query, opts) do
       devices =
@@ -407,8 +422,12 @@ defmodule Whatsmeow.User do
         |> Node.get_children("user")
         |> Enum.flat_map(fn user_node ->
           case parse_user_jid(user_node) do
-            nil -> []
-            jid -> parse_device_list(jid, Node.get_child(user_node, "devices"))
+            nil ->
+              []
+
+            jid ->
+              _ = learn_lid(jid, parse_lid(user_node))
+              parse_device_list(jid, Node.get_child(user_node, "devices"))
           end
         end)
 
@@ -416,6 +435,11 @@ defmodule Whatsmeow.User do
       {:ok, devices}
     end
   end
+
+  # Best effort, for the same reason `cache_lid_mappings/1` is: a mapping we
+  # fail to record costs one un-canonicalised send, never the message itself.
+  defp learn_lid(%JID{} = pn, %JID{} = lid), do: Whatsmeow.LIDMap.put(lid, pn)
+  defp learn_lid(_pn, _lid), do: :ok
 
   defp reject_unsupported_servers(jids) do
     case Enum.find(jids, &(&1.server == JID.messenger_server())) do

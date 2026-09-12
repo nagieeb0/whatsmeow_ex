@@ -28,18 +28,20 @@ defmodule Whatsmeow.Store.Postgres do
   #     182909923287057@lid          C14880FFA1E1990F
   #     201141465543@s.whatsapp.net  C14880FFA1E1990F
   #
-  # Everything is stored under the phone-number form, because that is what
-  # `get_user_devices/3` returns and what outbound addresses. An unmapped LID
-  # is left as it is: no worse than before, and it converges as soon as the
-  # mapping arrives.
-  defp canonical(their_id) do
-    case Whatsmeow.LIDMap.resolve(their_id) do
-      %Whatsmeow.Types.JID{} = jid -> Whatsmeow.Types.JID.to_string(jid)
-      _ -> their_id
-    end
-  rescue
-    _ -> their_id
-  end
+  # Everything is stored under the **LID** form, the direction WhatsApp is
+  # migrating toward. This used to resolve the other way, to the phone number,
+  # on the reasoning that `get_user_devices/3` answers in phone numbers and so
+  # does outbound addressing. That is true of the *wire address* and wrong for
+  # the *session key*: a peer whose account finishes migrating stops answering
+  # to its number and the split reopens. Upstream Go canonicalises to LID and
+  # keeps the phone number only as the `<to>` address.
+  #
+  # Note these four callbacks are not on the live crypto path — `Whatsmeow.Store`
+  # exposes device wrappers only, and the Signal path runs through
+  # `Whatsmeow.Signal.Store.Adapter`. They canonicalise anyway, through the same
+  # module the live path uses, so a future caller cannot reintroduce the split
+  # by picking the other direction. An unmapped peer is left exactly as it is.
+  defp canonical(their_id), do: Whatsmeow.Signal.Address.session_key(their_id)
 
   @impl true
   def new_device(opts) do

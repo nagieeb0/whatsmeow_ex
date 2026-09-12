@@ -22,7 +22,7 @@ defmodule Whatsmeow.Send do
   alias Whatsmeow.IQ
   alias Whatsmeow.PreKeyBundle
   alias Whatsmeow.Session
-  alias Whatsmeow.Signal.{Decrypt, Lock, WireEncrypt}
+  alias Whatsmeow.Signal.{Address, Decrypt, Lock, WireEncrypt}
   alias Whatsmeow.Store.Schemas.Device
   alias Whatsmeow.Types.JID
   alias Whatsmeow.User
@@ -332,7 +332,9 @@ defmodule Whatsmeow.Send do
               # this send was on the wire.
               _ =
                 Whatsmeow.Retry.RecentCache.put(
-                  JID.to_string(peer_jid),
+                  # Keyed on the canonical identity, bare, so the retry lookup
+                  # below finds it whichever address the receipt arrives from.
+                  Address.session_key(JID.to_non_ad(peer_jid)),
                   msg_id,
                   plaintext,
                   msg_type
@@ -1138,7 +1140,17 @@ defmodule Whatsmeow.Send do
           {:ok, envelope :: binary(), enc_type :: String.t(), new_session :: term()}
           | {:error, send_error()}
   def encrypt_plaintext_for_peer(server, %Device{} = device, %JID{} = peer, plaintext, opts) do
-    their_id = JID.to_string(peer)
+    # The session is filed under the peer's encryption identity (LID where one
+    # is known), never under the address we happen to be sending to. `peer`
+    # stays the wire address and stays the address we fetch a prekey bundle
+    # from below — upstream Go draws the same line, keeping
+    # `sessionAddressToJID` so the bundle IQ goes to the original JID while the
+    # session lives under `encryptionIdentity` (`whatsmeow-main/send.go:1285-1312`).
+    #
+    # Resolved here, before `Lock.with_session` below, so the lookup stays out
+    # of the critical section and both writers to this device — an inbound
+    # decrypt and this encrypt — compute the same lock key.
+    their_id = Address.session_key(peer)
     their_id_pub_override = Keyword.get(opts, :their_identity_pub)
 
     # Steady state runs under the per-session lock: load, encrypt, and store are
@@ -1215,32 +1227,60 @@ defmodule Whatsmeow.Send do
 
     case WireEncrypt.encrypt_signal_envelope(plaintext, sess, our_id_pub, their_id_pub) do
       {:ok, inner_envelope, new_sess} ->
-        _ = Decrypt.persist_session(device.jid, their_id, new_sess)
-
-        # Until the peer has acked ANY of our messages we MUST keep
-        # shipping `PreKeySignalMessage`s — the peer has no Signal
-        # session for us yet, so a bare `<enc type="msg">` would be
-        # silently dropped and the chat UI would stick on "Waiting
-        # for this message" forever. libsignal-java mirrors this via
-        # `SessionState.hasPendingPreKey()` — we mirror via
-        # `Session.pending_pre_key` on `%Whatsmeow.Signal.Session{}`.
+        # The advanced chain has to be durable *before* the envelope leaves.
+        # Sending on a chain we failed to store means the next encrypt reloads
+        # the old session and reuses chain key N for a second, different
+        # message — a nonce reuse, and the peer drops everything after it.
+        # Losing this one message is the cheaper failure and the only one the
+        # caller can see and retry. The write used to be discarded with `_ =`,
+        # so a database blip degraded silently into a wedged session.
         #
-        # `Map.get/2` (not dot-access) so legacy persisted Session
-        # structs that predate this field don't crash the encrypt
-        # path with `KeyError`. Missing == treated as `nil` ==
-        # steady-state `msg` — which is the right default for a
-        # session that has already exchanged messages.
-        case Map.get(sess, :pending_pre_key) do
-          %{} = pending ->
-            envelope = WireEncrypt.wrap_as_pkmsg(inner_envelope, pending)
-            {:ok, envelope, "pkmsg", new_sess}
+        # `:no_store` is the documented no-Repo mode and stays non-fatal:
+        # nothing was meant to be persisted, so nothing was lost.
+        with :ok <- persisted(device.jid, their_id, new_sess) do
+          # Until the peer has acked ANY of our messages we MUST keep
+          # shipping `PreKeySignalMessage`s — the peer has no Signal
+          # session for us yet, so a bare `<enc type="msg">` would be
+          # silently dropped and the chat UI would stick on "Waiting
+          # for this message" forever. libsignal-java mirrors this via
+          # `SessionState.hasPendingPreKey()` — we mirror via
+          # `Session.pending_pre_key` on `%Whatsmeow.Signal.Session{}`.
+          #
+          # `Map.get/2` (not dot-access) so legacy persisted Session
+          # structs that predate this field don't crash the encrypt
+          # path with `KeyError`. Missing == treated as `nil` ==
+          # steady-state `msg` — which is the right default for a
+          # session that has already exchanged messages.
+          case Map.get(sess, :pending_pre_key) do
+            %{} = pending ->
+              envelope = WireEncrypt.wrap_as_pkmsg(inner_envelope, pending)
+              {:ok, envelope, "pkmsg", new_sess}
 
-          _ ->
-            {:ok, inner_envelope, "msg", new_sess}
+            _ ->
+              {:ok, inner_envelope, "msg", new_sess}
+          end
         end
 
       {:error, reason} ->
         {:error, {:encrypt, reason}}
+    end
+  end
+
+  defp persisted(our_jid, their_id, sess) do
+    case Decrypt.persist_session(our_jid, their_id, sess) do
+      :ok ->
+        :ok
+
+      {:error, :no_store} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.error(
+          "[whatsmeow] refusing to send: could not persist the advanced session for " <>
+            "#{their_id}: #{inspect(reason)}"
+        )
+
+        {:error, {:persist_session, reason}}
     end
   end
 
@@ -1296,6 +1336,7 @@ defmodule Whatsmeow.Send do
     Logger.warning("[whatsmeow] dm fanout: task crashed: #{inspect(reason)}")
     acc
   end
+
   # --- answering a retry receipt ---------------------------------------
 
   @doc """
@@ -1332,7 +1373,7 @@ defmodule Whatsmeow.Send do
   Mirrors Go's `handleRetryReceipt` (`whatsmeow-main/retry.go`).
   """
   def answer_retry(server, %Device{} = device, device_id, %JID{} = from, msg_id) do
-    case Whatsmeow.Retry.RecentCache.get(JID.to_string(JID.to_non_ad(from)), msg_id) do
+    case Whatsmeow.Retry.RecentCache.get(Address.session_key(JID.to_non_ad(from)), msg_id) do
       :not_found ->
         Logger.warning(
           "[whatsmeow] retry receipt for an unknown or expired message id=#{msg_id}",
@@ -1347,7 +1388,6 @@ defmodule Whatsmeow.Send do
     end
   end
 
-
   # The cache stores the JID as a string; everything downstream wants a
   # struct. Falls back to the retrying device's own bare JID, which is the
   # same conversation by definition.
@@ -1359,6 +1399,7 @@ defmodule Whatsmeow.Send do
   rescue
     _ -> from
   end
+
   defp resend_to_device(server, device, from, peer_jid, plaintext, msg_type, msg_id) do
     Logger.info(
       "[whatsmeow] answering a retry receipt id=#{msg_id} device=#{JID.to_string(from)}",
@@ -1387,5 +1428,4 @@ defmodule Whatsmeow.Send do
         {:error, other}
     end
   end
-
 end

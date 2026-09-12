@@ -40,6 +40,7 @@ defmodule Whatsmeow.Receipt do
       type: type,
       message_ids: Enum.reject(ids, &is_nil/1),
       from: parse_jid(Node.attr(node, "from")),
+      participant: parse_jid(Node.attr(node, "participant")),
       timestamp: DateTime.utc_now()
     }
   end

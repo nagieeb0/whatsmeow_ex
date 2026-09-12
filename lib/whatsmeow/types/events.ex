@@ -133,7 +133,7 @@ defmodule Whatsmeow.Types.Events do
 
   defmodule Receipt do
     @moduledoc "Delivery / read receipt for an outbound message."
-    defstruct [:device_id, :type, :message_ids, :from, :timestamp]
+    defstruct [:device_id, :type, :message_ids, :from, :participant, :timestamp]
 
     @type kind :: :delivery | :read | :played | :server_error | :inactive | :sender
     @type t :: %__MODULE__{
@@ -141,6 +141,11 @@ defmodule Whatsmeow.Types.Events do
             type: kind,
             message_ids: [String.t()],
             from: JID.t(),
+            # Group receipts address the group in `from` and the individual
+            # sender in `participant`. A retry receipt has to be answered to
+            # the device that asked, so the sender is the one that matters.
+            # `nil` in a 1:1 chat, where `from` is already the device.
+            participant: JID.t() | nil,
             timestamp: DateTime.t()
           }
   end

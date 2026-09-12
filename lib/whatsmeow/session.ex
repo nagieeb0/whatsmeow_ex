@@ -2133,16 +2133,26 @@ defmodule Whatsmeow.Session do
   # Never at the cost of the ack — a raise here would leave the stanza
   # unacknowledged and the server would replay it for ever, which is the
   # failure this whole area is about.
-  defp maybe_answer_retry(state, %{type: :retry, message_ids: ids, from: %{} = from})
+  defp maybe_answer_retry(state, %{type: :retry, message_ids: ids, from: %{} = from} = receipt)
        when is_list(ids) do
     server = self()
 
-    for msg_id <- ids, is_binary(msg_id), bump_retry_count({:answered, msg_id}) <= @retry_answer_cap do
+    # In a group the receipt names the group in `from` and the device that
+    # could not decrypt in `participant`. Re-encrypting to the group JID would
+    # build a session against an address that has no Signal identity, so the
+    # device that asked would go on seeing "waiting for this message" through
+    # all three retries. 1:1 receipts carry no `participant` and `from` is
+    # already the right device.
+    asker = Map.get(receipt, :participant) || from
+
+    for msg_id <- ids,
+        is_binary(msg_id),
+        bump_retry_count({:answered, msg_id}) <= @retry_answer_cap do
       device = state.device
       device_id = state.device_id
 
       Task.Supervisor.start_child(Whatsmeow.Media.TaskSup, fn ->
-        Whatsmeow.Send.answer_retry(server, device, device_id, from, msg_id)
+        Whatsmeow.Send.answer_retry(server, device, device_id, asker, msg_id)
       end)
     end
 
