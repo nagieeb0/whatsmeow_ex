@@ -53,7 +53,23 @@ defmodule Whatsmeow.Session do
   plus a uniform 0–500 ms jitter. Cleared on a successful `<success>`.
   """
 
-  use GenServer
+  # `:transient` — restart on a crash, stay down on a deliberate `:normal` stop.
+  #
+  # `on_failure/2` answers a refused identity (401/403/406) by clearing
+  # `auto_reconnect?` and stopping with `:normal`, because retrying is
+  # re-authenticating a deleted device in a loop. Under the default
+  # `:permanent` the supervisor restarted it anyway, `init/1` rebuilt
+  # `auto_reconnect?` from opts — where it defaults to `true` — and
+  # `dial_on_boot?/1` saw a JID still in the row and dialled again. Measured on
+  # one device: 63 × `<failure reason=:logged_out>` with the next `connecting`
+  # three milliseconds later, and a device index that climbed to `:44@lid`.
+  #
+  # `auto_reconnect?: false` is per-process state. A stop is the only thing that
+  # outlives the process, so the restart policy is where that decision has to
+  # live. A crash still restarts and still self-dials — that is the behaviour
+  # `5ff9ac5` added and it is untouched here; only the deliberate stop is now
+  # honoured.
+  use GenServer, restart: :transient
 
   require Logger
 
@@ -675,12 +691,25 @@ defmodule Whatsmeow.Session do
         device_id: state.device_id
       })
 
+      # `reconnect_attempts` is **not** zeroed here.
+      #
+      # It used to be, and the reasoning was that completing a Noise handshake
+      # is evidence the connection works. It is evidence the *transport* works,
+      # and the failure this backoff exists for is the one where the transport
+      # works and login never happens: handshake fine, socket dropped before
+      # `<success>`, redial. Zeroing here made every cycle `attempt=1`, so the
+      # documented 1s → 5min ramp never engaged — 1,506 connect attempts, 1,500
+      # handshakes and one `LoggedIn` in a single log.
+      #
+      # So it is zeroed on `<success>` instead, beside `failure_retries`, which
+      # has always reset there for the same reason: authenticated, not merely
+      # connected. `keepalive_failures` still resets here, because the keepalive
+      # genuinely starts here (see below).
       state = %{
         state
         | transport_conn: conn,
           noise_socket: ns,
           status: :connected,
-          reconnect_attempts: 0,
           keepalive_failures: 0
       }
 
@@ -2020,8 +2049,11 @@ defmodule Whatsmeow.Session do
         |> Map.put(:status, :authenticated)
         |> Map.put(:keepalive_failures, 0)
         # Authenticated, not merely connected — the only evidence that whatever
-        # the server was refusing has stopped.
+        # the server was refusing has stopped. `reconnect_attempts` joins it
+        # here for the same reason: a handshake that never becomes a login is
+        # not a connection that is working.
         |> Map.put(:failure_retries, 0)
+        |> Map.put(:reconnect_attempts, 0)
         |> schedule_keepalive()
 
       {:error, reason} ->
@@ -2145,7 +2177,36 @@ defmodule Whatsmeow.Session do
     # WAVersion.Refresher waits for its next hourly tick.
     if code == "500", do: trigger_wa_version_refresh_async(state.device_id)
 
-    state
+    act_on_stream_error(state, ConnectionEvents.decode_stream_error(node))
+  end
+
+  # The classifier was written, documented and doctested, and nothing outside
+  # its own test file ever called it. So `<stream:error>` produced a log line, a
+  # telemetry event, and no action whatsoever — for every code.
+  #
+  # The two that matter most are the two a deploy produces:
+  #
+  #   * `515` is the server *asking* us to re-handshake. It is the normal first
+  #     reconnect after a pair, and ignoring it meant recovery only arrived
+  #     later and indirectly, via a TCP close or the keepalive.
+  #   * `conflict type="replaced"` is another socket having taken this device —
+  #     which is exactly what an overlapping deploy produces on CranL, where the
+  #     old container is still serving while the new one boots. Ignoring it left
+  #     two clients on one Signal ratchet fighting, and that flapping is what
+  #     ends in the 401 this file is otherwise careful to avoid.
+  #
+  # `device_removed` and `replaced` are terminal in the same sense `on_failure/2`
+  # means it: stop, and let the restart policy keep us stopped.
+  defp act_on_stream_error(state, reason) do
+    if ConnectionEvents.should_reconnect?(reason) do
+      handle_disconnect(state, {:stream_error, reason})
+    else
+      broadcast_logged_out(state, reason)
+
+      %{state | auto_reconnect?: false}
+      |> handle_disconnect({:stream_error, reason})
+      |> Map.put(:status, :stopping)
+    end
   end
 
   defp trigger_wa_version_refresh_async(device_id) do
