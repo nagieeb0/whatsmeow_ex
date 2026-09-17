@@ -163,9 +163,18 @@ defmodule Whatsmeow.SessionTest do
       node = Node.new("stream:error", %{"code" => "500"})
       state = base_state(device_id) |> Session.__dispatch_node__(node)
 
-      # <stream:error> alone doesn't tear the local state down — that happens
-      # on the follow-up <xmlstreamend> from the server.
-      assert state.status == :connected
+      # `<stream:error>` used to be telemetry and nothing else — the state was
+      # only torn down on the follow-up `<xmlstreamend>`. It is now acted on
+      # directly, because waiting for a TCP close meant a deploy's `replaced`
+      # conflict left two clients fighting over one Signal ratchet until the
+      # socket happened to drop.
+      #
+      # A code nobody recognises is a *disconnection*: the session comes down
+      # and the backoff brings it back. What it must never be is `:stopping`,
+      # which is reserved for the two reasons that mean we are out — the device
+      # removed from the account, and another socket taking it.
+      assert state.status == :disconnected
+      refute state.status == :stopping
       assert_receive {:telemetry, %{code: "500"}}, 200
 
       :telemetry.detach("stream-error-test-#{device_id}")

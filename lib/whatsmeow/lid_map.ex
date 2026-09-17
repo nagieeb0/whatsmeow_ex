@@ -29,7 +29,6 @@ defmodule Whatsmeow.LIDMap do
   than a second table to keep consistent.
   """
 
-
   alias Whatsmeow.Store.Schemas.LIDMap, as: Schema
   alias Whatsmeow.Types.JID
 

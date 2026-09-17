@@ -34,7 +34,6 @@ defmodule Mix.Tasks.Whatsmeow.Repl do
   alias Whatsmeow.Store.Schemas.Device
   alias Whatsmeow.Types.Events
 
-
   @impl Mix.Task
   def run(argv) do
     Application.ensure_all_started(:whatsmeow_ex)

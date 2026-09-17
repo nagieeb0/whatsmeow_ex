@@ -40,7 +40,6 @@ defmodule Whatsmeow.PreKeys do
   reference this `preKeyId`.
   """
 
-
   alias Whatsmeow.Binary.Node
   alias Whatsmeow.Crypto.Curve25519
   alias Whatsmeow.IQ

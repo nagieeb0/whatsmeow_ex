@@ -37,10 +37,20 @@ defmodule Whatsmeow.ConnectionEventsTest do
       refute CE.should_reconnect?(:replaced)
     end
 
-    test "unknown code → {:unknown, code}" do
+    # **An unknown code is a disconnection, not a verdict.**
+    #
+    # This asserted `refute`, which was harmless while nothing acted on the
+    # answer and became "stop for ever" once `Session.act_on_stream_error/2`
+    # used it to decide terminality: every code this module does not recognise
+    # — including `500`, which the session's own client-outdated recovery is
+    # written for — permanently stopped the session, and `restart: :transient`
+    # kept it stopped.
+    #
+    # Only two reasons mean "we are out", and the server states both.
+    test "unknown code → {:unknown, code}, and we still try again" do
       n = Node.new("stream:error", %{"code" => "9999"}, nil)
       assert CE.decode_stream_error(n) == {:unknown, "9999"}
-      refute CE.should_reconnect?({:unknown, "9999"})
+      assert CE.should_reconnect?({:unknown, "9999"})
     end
 
     test "missing code → {:unknown, nil}" do

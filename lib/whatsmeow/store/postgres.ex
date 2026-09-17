@@ -163,30 +163,63 @@ defmodule Whatsmeow.Store.Postgres do
                 {"DELETE FROM whatsmeow_chat_settings WHERE our_jid = $1", [jid]},
                 {"DELETE FROM whatsmeow_contacts WHERE our_jid = $1", [jid]},
                 {"DELETE FROM whatsmeow_privacy_tokens WHERE our_jid = $1", [jid]},
-                {"DELETE FROM whatsmeow_lid_map WHERE our_jid = $1", [jid]},
                 {"DELETE FROM whatsmeow_event_buffer WHERE our_jid = $1", [jid]},
                 {"DELETE FROM whatsmeow_retry_buffer WHERE our_jid = $1", [jid]},
                 {"DELETE FROM whatsmeow_nct_salt WHERE our_jid = $1", [jid]},
                 {"DELETE FROM whatsmeow_pre_keys WHERE jid = $1", [jid]}
               ] do
-            # Each table is best-effort against an older migration that
-            # hasn't created it yet. `savepoint` so a missing table
-            # doesn't blow the outer transaction.
-            try do
-              Ecto.Adapters.SQL.query!(Repo, sql, params)
-            rescue
-              e in [Postgrex.Error] ->
-                case e do
-                  %Postgrex.Error{postgres: %{code: :undefined_table}} -> :ok
-                  _ -> Repo.rollback({:delete_device, e})
-                end
+            # Each table is best-effort against an older migration that has
+            # not created it yet.
+            #
+            # **`mode: :savepoint`, and the old comment claimed it without
+            # doing it.** A `try/rescue` catches the Elixir exception, but by
+            # then Postgres has already marked the transaction aborted — so
+            # every statement after the first missing table failed with
+            # `in_failed_sql_transaction` and the whole cascade rolled back.
+            # The per-table tolerance the comment describes never worked.
+            #
+            # A savepoint is what makes one statement's failure local to it.
+            case Ecto.Adapters.SQL.query(Repo, sql, params, mode: :savepoint) do
+              {:ok, _} ->
+                :ok
+
+              # A table an older migration has not created, or a column it does
+              # not have. `:undefined_column` was missing from this list and
+              # cost the function everything it does — see below.
+              {:error, %Postgrex.Error{postgres: %{code: code}}}
+              when code in [:undefined_table, :undefined_column] ->
+                :ok
+
+              {:error, e} ->
+                Repo.rollback({:delete_device, e})
             end
           end
 
           Repo.delete!(device)
         end)
+        |> case do
+          {:ok, _} ->
+            :ok
 
-        :ok
+          # **The result was discarded and `:ok` returned unconditionally.**
+          #
+          # Combined with the two bugs above, every call did this: the
+          # `whatsmeow_lid_map` statement filtered on `our_jid`, a column that
+          # table does not have — it is keyed on `lid`/`pn` — so Postgres
+          # raised `:undefined_column`, which was not in the tolerated set, so
+          # the whole transaction rolled back. Every session, identity key,
+          # pre-key and sender key survived a "delete", and the caller was told
+          # it had worked.
+          #
+          # Which is exactly the stale-ratchet condition the comment at the top
+          # of this function warns about: the re-paired device gets a fresh
+          # identity_key and noise_key while the old `whatsmeow_sessions` row
+          # still references the previous chain, so the first outbound envelope
+          # is undecryptable. "I unpaired and paired again and it still does not
+          # work" is this, and it was unreportable because nothing failed.
+          {:error, reason} ->
+            {:error, reason}
+        end
 
       {:error, _} = e ->
         e

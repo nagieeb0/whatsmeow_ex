@@ -97,7 +97,22 @@ defmodule Whatsmeow.ConnectionEvents do
   def should_reconnect?(:cat_expired), do: true
   def should_reconnect?(:device_removed), do: false
   def should_reconnect?(:replaced), do: false
-  def should_reconnect?({:unknown, _}), do: false
+
+  # **An unknown code is not a verdict.**
+  #
+  # This returned `false`, which was harmless while nothing acted on it and
+  # became "stop for ever" the moment `Session.act_on_stream_error/2` started
+  # using this function to decide terminality. Every `<stream:error>` this
+  # module does not recognise — including `500`, which the session's own
+  # `client-outdated` recovery path is written for — permanently stopped the
+  # session, and `restart: :transient` kept it stopped.
+  #
+  # Only two reasons mean "we are out": the device was removed from the
+  # account, and another socket took it. Both are stated by the server in so
+  # many words. Anything else is a disconnection, and a disconnection is
+  # something to retry — the backoff is what stops a retry loop being
+  # expensive, not a refusal to try at all.
+  def should_reconnect?(_unrecognised), do: true
 
   # --- <failure> -------------------------------------------------------------
 
