@@ -89,6 +89,88 @@ defmodule Whatsmeow.IQ do
   end
 
   @doc """
+  The four stanzas a connect sends and this port never did.
+
+  ## Why they exist
+
+  `amarula`, an independent Elixir WhatsApp client that mirrors Baileys, sends
+  these on every login and says why in a comment its author clearly earned
+  (`connection.ex:3417`):
+
+  > *Baileys `executeInitQueries` (chats.ts), fired on `open`: fetchProps +
+  > blocklist + privacy. **These appear to be a server-side precondition for
+  > E2E key-exchange: without them the server SILENTLY ignores our prekey-bundle
+  > fetches (answers every other IQ).***
+
+  That is, to the word, the state this library has been stuck in: an
+  authenticated socket whose keepalive IQs are answered, whose receipts arrive,
+  whose `<active/>` is accepted — and which the server will not feed.
+
+  Go sends `unified_session` too (`client.go:1091`). Neither Go nor this port
+  sent the other three.
+
+  All four are fire-and-forget, matching Baileys, which does not block sends on
+  the replies.
+  """
+  @spec build_unified_session() :: Node.t()
+  def build_unified_session do
+    # `(now + 3 days) % 7 days` — Baileys' `getUnifiedSessionId()`, mirrored by
+    # both Go (`getUnifiedSessionID`) and amarula. The value is a rotating
+    # bucket, not an identifier of anything.
+    three_days = 3 * 24 * 60 * 60 * 1000
+    seven_days = 7 * 24 * 60 * 60 * 1000
+    id = rem(System.system_time(:millisecond) + three_days, seven_days)
+
+    Node.new("ib", %{}, [
+      Node.new("unified_session", %{"id" => Integer.to_string(id)}, nil)
+    ])
+  end
+
+  @doc """
+  `<iq type="get" xmlns="encrypt"><digest/></iq>` — ask the server to validate
+  our key bundle.
+
+  amarula's comment: *"digestKeyBundle: server validates our key bundle; if no
+  `<digest>` in reply we re-upload prekeys."* So the reply is not decoration —
+  its absence is the server saying our published keys are not what it holds.
+  """
+  @spec build_digest(String.t() | nil) :: Node.t()
+  def build_digest(id \\ nil) do
+    Node.new(
+      "iq",
+      %{"id" => id || generate_id(), "to" => server_jid(), "type" => "get", "xmlns" => "encrypt"},
+      [Node.new("digest", %{}, nil)]
+    )
+  end
+
+  @doc """
+  Baileys' `executeInitQueries`, in order: abt/props, blocklist, privacy.
+
+  Returned as a list because they go out together and none of them is
+  interesting on its own.
+  """
+  @spec build_init_queries() :: [Node.t()]
+  def build_init_queries do
+    [
+      Node.new(
+        "iq",
+        %{"id" => generate_id(), "to" => server_jid(), "type" => "get", "xmlns" => "abt"},
+        [Node.new("props", %{"protocol" => "1"}, nil)]
+      ),
+      Node.new(
+        "iq",
+        %{"id" => generate_id(), "to" => server_jid(), "type" => "get", "xmlns" => "blocklist"},
+        nil
+      ),
+      Node.new(
+        "iq",
+        %{"id" => generate_id(), "to" => server_jid(), "type" => "get", "xmlns" => "privacy"},
+        [Node.new("privacy", %{}, nil)]
+      )
+    ]
+  end
+
+  @doc """
   Build a `<presence>` stanza. WhatsApp wants this sent at least once
   after login so peers see your `push_name` (otherwise they see "-").
 

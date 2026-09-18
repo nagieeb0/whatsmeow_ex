@@ -51,9 +51,9 @@ defmodule Whatsmeow.MessageInfo do
   decoupled from session state).
   """
   @spec from_node(Node.t(), JID.t() | nil) :: {:ok, t()} | {:error, atom()}
-  def from_node(node, own_jid \\ nil)
+  def from_node(node, own_jid \\ nil, own_lid \\ nil)
 
-  def from_node(%Node{tag: "message"} = node, own_jid) do
+  def from_node(%Node{tag: "message"} = node, own_jid, own_lid) do
     with {:ok, id} <- get_id(node),
          {:ok, from} <- get_jid(node, "from"),
          {:ok, ts} <- get_timestamp(node) do
@@ -61,12 +61,23 @@ defmodule Whatsmeow.MessageInfo do
       participant = optional_jid(node, "participant")
       is_group? = from.server == JID.group_server()
 
-      is_from_me? =
-        case {own_jid, from, participant} do
-          {%JID{user: ou}, _, %JID{user: pu}} when is_group? -> ou == pu
-          {%JID{user: ou}, %JID{user: fu}, _} -> ou == fu
-          _ -> false
-        end
+      # **Both of our addresses, because we have two.**
+      #
+      # This compared against the phone number alone. A device also has a LID,
+      # `Whatsmeow.Store.Schemas.Device` has carried the column the whole time,
+      # and nothing in `session.ex` ever read it.
+      #
+      # Go checks both (`message.go:110`):
+      #
+      #     if source.Sender.User == clientID.User || source.Sender.User == clientLID.User
+      #
+      # What that cost here: `maybe_start_history_sync/3` opens with
+      # `with true <- info.is_from_me?`, so a history-sync notification the
+      # server addressed from the account's own LID answered `false` — no
+      # `hist_sync` receipt, no download, and a bare `rescue _ -> :ok` below it
+      # meaning not one line of log. The feature looked unimplemented.
+      sender_of_record = if is_group?, do: participant, else: from
+      is_from_me? = ours?(sender_of_record, own_jid) or ours?(sender_of_record, own_lid)
 
       addressing_mode = Node.attr(node, "addressing_mode")
       sender = if is_group?, do: participant, else: from
@@ -88,7 +99,10 @@ defmodule Whatsmeow.MessageInfo do
     end
   end
 
-  def from_node(%Node{}, _own_jid), do: {:error, :not_a_message_node}
+  def from_node(%Node{}, _own_jid, _own_lid), do: {:error, :not_a_message_node}
+
+  defp ours?(%JID{user: user}, %JID{user: user}) when is_binary(user) and user != "", do: true
+  defp ours?(_sender, _ours), do: false
 
   # --- the sender's other address --------------------------------------------
 

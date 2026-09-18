@@ -1072,7 +1072,7 @@ defmodule Whatsmeow.Session do
         )
       end
 
-      {:noreply, send_active_iq(state)}
+      {:noreply, state |> send_active_iq() |> finish_login()}
     else
       {:noreply, state}
     end
@@ -1501,7 +1501,7 @@ defmodule Whatsmeow.Session do
       %{device_id: state.device_id, from: Binary.Node.attr(msg, "from")}
     )
 
-    case Whatsmeow.MessageInfo.from_node(msg, own_jid) do
+    case Whatsmeow.MessageInfo.from_node(msg, own_jid, own_lid(state.device)) do
       {:ok, info} ->
         # The server volunteers the sender's other address on some stanzas and
         # not others. Recording it the moment it appears is what makes the
@@ -2230,6 +2230,18 @@ defmodule Whatsmeow.Session do
   end
 
   defp own_jid(_), do: nil
+
+  # The account's LID, parsed. `Device` has carried this column since LID
+  # addressing arrived and `session.ex` never read it — see `MessageInfo`'s
+  # `is_from_me?` for what that cost.
+  defp own_lid(%Device{lid: lid}) when is_binary(lid) and lid != "" do
+    case Whatsmeow.Types.JID.parse(lid) do
+      {:ok, j} -> j
+      _ -> nil
+    end
+  end
+
+  defp own_lid(_device), do: nil
 
   # --- pair-device → QR ----------------------------------------------------
 
@@ -3040,6 +3052,34 @@ defmodule Whatsmeow.Session do
   # so a host with a deaf number has something to read other than silence. Not
   # blocking: the bootstrap runs on the session's own mailbox and a server that
   # never answers must not stall the process that reconnects it.
+  # **The rest of the connect, which this port never sent.**
+  #
+  # `amarula` — an independent Elixir client mirroring Baileys — runs five steps
+  # on login (`connection.ex:4801`). We ran two. The missing three, in its order:
+  #
+  #   * `<ib><unified_session id=…/></ib>` — Go sends this as well
+  #     (`client.go:1091`); we did not.
+  #   * `<iq get xmlns="encrypt"><digest/></iq>` — the server validates our key
+  #     bundle. amarula: *"if no `<digest>` in reply we re-upload prekeys."*
+  #   * Baileys' `executeInitQueries`: abt/props, blocklist, privacy — with the
+  #     comment this whole change rests on: *"These appear to be a server-side
+  #     precondition for E2E key-exchange: without them the server SILENTLY
+  #     ignores our prekey-bundle fetches (answers every other IQ)."*
+  #
+  # That last sentence is the state measured here for six hours on 19 September:
+  # authenticated, keepalives answered, receipts arriving, `<active/>` accepted,
+  # and a queue the server announced and would not hand over.
+  #
+  # Fire-and-forget, as in Baileys, which does not block sends on the replies.
+  defp finish_login(state) do
+    state
+    |> send_node_or_log(IQ.build_unified_session(), "unified_session")
+    |> send_node_or_log(IQ.build_digest(), "digest")
+    |> then(fn state ->
+      Enum.reduce(IQ.build_init_queries(), state, &send_node_or_log(&2, &1, "init query"))
+    end)
+  end
+
   defp send_active_iq(state) do
     id = IQ.generate_id()
 
