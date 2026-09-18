@@ -156,6 +156,21 @@ defmodule Whatsmeow.Session do
     # zero stanzas. Go asks the server for this count; this port never did.
     :logged_in_at,
     :prekeys_on_server,
+    # **Does WhatsApp advertise this device to the people trying to reach it?**
+    #
+    # A sender fans a message out to one copy per *device* on the recipient's
+    # account, and it learns that list from a `usync` query to the server. A
+    # companion the server does not list is a companion nobody encrypts to — so
+    # no message is ever addressed to it, and none is ever queued for it.
+    #
+    # From in here that is indistinguishable from a quiet chat, and it survives
+    # every other check: the socket is authenticated, keepalive IQs flow both
+    # ways, the server answers `<active/>`, the pre-key pool is full, and the
+    # count of stanzas taken off the wire climbs the whole time — with not one
+    # `<message>` among them. Measured in exactly that state on 19 September.
+    #
+    # `{own_device_count, are_we_in_it?}`, asked once at login.
+    :own_devices,
     :auto_reconnect?,
     # QR-ref rotation: each `<pair-device>` IQ carries 4-6 refs.
     # The server expects the host UI to display them ONE AT A TIME,
@@ -548,7 +563,8 @@ defmodule Whatsmeow.Session do
        pending_count: map_size(state.pending),
        active_iq: state.active_iq || :unsent,
        logged_in_at: state.logged_in_at,
-       prekeys_on_server: state.prekeys_on_server
+       prekeys_on_server: state.prekeys_on_server,
+       own_devices: state.own_devices
      }, state}
   end
 
@@ -945,6 +961,25 @@ defmodule Whatsmeow.Session do
   # a return value. It is the single most useful fact about a device that is
   # authenticated and receiving nothing: at zero, no stranger can start a
   # conversation with this number, and every other signal still reads healthy.
+  # **Whether the server lists this device among the account's own.**
+  #
+  # A sender encrypts one copy per device on the recipient's account and learns
+  # that list from `usync`. A companion the server does not advertise is one
+  # nobody can address — no message is sent to it and none is queued for it —
+  # and every local signal stays green throughout.
+  def handle_info({:own_devices, {count, listed?}}, state) do
+    unless listed? do
+      Logger.error(
+        "[whatsmeow] this device is NOT in its own account's device list " <>
+          "(#{count} listed). Senders fan a message out to the devices this " <>
+          "query returns, so nothing will ever be addressed to this one.",
+        device_id: state.device_id
+      )
+    end
+
+    {:noreply, %{state | own_devices: %{count: count, listed: listed?}}}
+  end
+
   def handle_info({:prekeys_on_server, count}, state) when is_integer(count) do
     if count < Whatsmeow.PreKeys.min_count() do
       Logger.error(
@@ -2864,8 +2899,27 @@ defmodule Whatsmeow.Session do
     # mid-flight, an upload that raced a deploy — and only the second number
     # decides whether a stranger can message this device.
     refresh_prekey_count(server)
+    refresh_own_devices(server)
   rescue
     e -> Logger.warning("[whatsmeow] prekey upload crashed", reason: Exception.message(e))
+  end
+
+  # Asked of the server, about ourselves. `Whatsmeow.User.get_user_devices/3` is
+  # the same `usync` a *sender* runs before encrypting to this account, so the
+  # answer is literally the list every peer will use — not our opinion of it.
+  defp refresh_own_devices(server) do
+    alias Whatsmeow.Types.JID, as: J
+
+    with {:ok, %Device{jid: jid}} when is_binary(jid) <- get_device(server),
+         {:ok, %J{} = ours} <- J.parse(jid),
+         {:ok, devices} <- Whatsmeow.User.get_user_devices(server, [J.to_non_ad(ours)]) do
+      listed? = Enum.any?(devices, &(&1.device == ours.device and &1.user == ours.user))
+      send(server, {:own_devices, {length(devices), listed?}})
+    end
+  rescue
+    _ -> :ok
+  catch
+    :exit, _ -> :ok
   end
 
   defp refresh_prekey_count(server) do
