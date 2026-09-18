@@ -94,6 +94,10 @@ defmodule Whatsmeow.Session do
   # `<active/>` regardless. A passive device receives nothing at all, so a hung
   # upload must not be able to silence the number for ever.
   @active_after_prekeys_ms 20_000
+  # How long to let an announced offline queue arrive before deciding it is not
+  # going to, and how many times to ask the server to start again.
+  @offline_sync_grace_ms 25_000
+  @offline_sync_pokes 3
 
   @keepalive_base_ms 25_000
   @keepalive_jitter_ms 2_500
@@ -207,7 +211,20 @@ defmodule Whatsmeow.Session do
     # which is the ban shape this file is otherwise careful to avoid.
     failure_retries: 0,
     sent: [],
-    pending: %{}
+    pending: %{},
+    # **The offline queue the server announced, and how much of it turned up.**
+    #
+    # `<ib><offline_preview message="N"/>` is the server saying it is about to
+    # hand over N messages. Measured repeatedly on 19 September: N is thirteen,
+    # the socket is authenticated and two-way, receipts and keepalives flow, and
+    # **not one `<message>` arrives** — and `<ib><offline/>`, which would say the
+    # sync had finished, never comes either. A sync that begins and never ends.
+    #
+    # Root cause unknown at time of writing. What is known is that the state is
+    # unambiguous from in here, which is what `:offline_sync_check` acts on.
+    offline_expected: 0,
+    offline_arrived: 0,
+    offline_pokes: 0
   ]
 
   @type status ::
@@ -294,6 +311,12 @@ defmodule Whatsmeow.Session do
 
   @doc "How long a connect waits for the pre-key pool before going active anyway."
   def active_after_prekeys_ms, do: @active_after_prekeys_ms
+
+  @doc "How long an announced offline queue has to arrive before we restart the sync."
+  def offline_sync_grace_ms, do: @offline_sync_grace_ms
+
+  @doc "How many times we ask the server to restart a stalled offline sync."
+  def offline_sync_pokes, do: @offline_sync_pokes
 
   @doc "Send a pre-built binary-XML `Node` over the wire. Returns `:ok` or `{:error, reason}`."
   @spec send_node(pid() | String.t(), Binary.Node.t()) :: :ok | {:error, term()}
@@ -986,6 +1009,65 @@ defmodule Whatsmeow.Session do
   # Either the pre-key work finished or its deadline did. Whichever arrives
   # first sends the stanza; the second is a no-op, because `active_iq` is only
   # `nil`/`:unsent` before the first one runs.
+  # **The server said it had messages for us and then sent none.**
+  #
+  # Measured repeatedly on 19 September: `<ib><offline_preview message="13"/>`,
+  # an authenticated two-way socket carrying receipts and keepalives, zero
+  # `<message>` stanzas, and no `<ib><offline/>` to say the sync had ended. The
+  # root cause is not known. What *is* known is that the state is unambiguous
+  # from in here, and that a clinic in it receives nothing until a person
+  # re-pairs the phone.
+  #
+  # So it is treated as a fault to recover from rather than a mystery to wait
+  # on. `<passive/>` then `<active/>` is the documented way to ask the server to
+  # start feeding this device — Go exposes `SetPassive` publicly for exactly
+  # this kind of host-driven control — and re-sending it costs two stanzas.
+  #
+  # Bounded at `@offline_sync_pokes`. If the queue still has not moved after
+  # that, nothing this process can do will move it, and the telemetry below is
+  # what turns a silent number into somebody's phone ringing.
+  def handle_info(:offline_sync_check, state) do
+    cond do
+      state.status != :authenticated or state.offline_expected == 0 ->
+        {:noreply, state}
+
+      state.offline_arrived > 0 ->
+        {:noreply, %{state | offline_expected: 0}}
+
+      state.offline_pokes >= @offline_sync_pokes ->
+        Logger.error(
+          "[whatsmeow] the server announced #{state.offline_expected} queued messages " <>
+            "and delivered none after #{state.offline_pokes} attempts to restart the " <>
+            "sync. This device is authenticated and will not be fed; it needs re-pairing.",
+          device_id: state.device_id
+        )
+
+        :telemetry.execute(
+          [:whatsmeow, :session, :offline_sync_stalled],
+          %{expected: state.offline_expected, pokes: state.offline_pokes},
+          %{device_id: state.device_id}
+        )
+
+        {:noreply, %{state | offline_expected: 0}}
+
+      true ->
+        Logger.warning(
+          "[whatsmeow] #{state.offline_expected} queued messages announced and none " <>
+            "delivered — re-sending passive/active to restart the sync " <>
+            "(attempt #{state.offline_pokes + 1}/#{@offline_sync_pokes})",
+          device_id: state.device_id
+        )
+
+        state =
+          state
+          |> send_node_or_log(IQ.build_set_passive(true, IQ.generate_id()), "passive")
+          |> send_active_iq()
+
+        Process.send_after(self(), :offline_sync_check, @offline_sync_grace_ms)
+        {:noreply, %{state | offline_pokes: state.offline_pokes + 1}}
+    end
+  end
+
   def handle_info(reason, state) when reason in [:go_active, :go_active_anyway] do
     if state.status == :authenticated and state.active_iq in [nil, :unsent] do
       if reason == :go_active_anyway do
@@ -1418,6 +1500,8 @@ defmodule Whatsmeow.Session do
     # opposite problems. A host watching a device that announces thirty-five
     # queued messages and decrypts none has no way, without this, to tell
     # whether the bytes ever came.
+    state = %{state | offline_arrived: state.offline_arrived + 1}
+
     :telemetry.execute(
       [:whatsmeow, :session, :message_received],
       %{system_time: System.system_time()},
@@ -2719,9 +2803,7 @@ defmodule Whatsmeow.Session do
       notices: inspect(notices)
     )
 
-    Enum.each(notices, &announce_ib(state, &1))
-
-    state
+    Enum.reduce(notices, state, &announce_ib(&2, &1))
   end
 
   defp announce_ib(state, {:offline_preview, counts}) do
@@ -2729,6 +2811,14 @@ defmodule Whatsmeow.Session do
       state.device_id,
       struct(Events.OfflineSyncPreview, Map.put(counts, :device_id, state.device_id))
     )
+
+    expected = Map.get(counts, :messages, 0)
+
+    if expected > 0 do
+      Process.send_after(self(), :offline_sync_check, @offline_sync_grace_ms)
+    end
+
+    %{state | offline_expected: expected, offline_arrived: 0, offline_pokes: 0}
   end
 
   defp announce_ib(state, {:offline_complete, count}) do
@@ -2736,12 +2826,15 @@ defmodule Whatsmeow.Session do
       device_id: state.device_id,
       count: count
     })
+
+    # The sync finished, so the watch is over whatever was delivered.
+    %{state | offline_expected: 0}
   end
 
   # `dirty` and `downgrade_webclient` are decoded and deliberately not
   # broadcast: Go ignores the first and the second is about a pairing mode this
   # library does not support.
-  defp announce_ib(_state, _other), do: :ok
+  defp announce_ib(state, _other), do: state
 
   # Log helper for unknown server iqs. Promoted from debug → info
   # because "unhandled <iq>" is rare and worth seeing once during
