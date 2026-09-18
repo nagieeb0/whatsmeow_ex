@@ -137,6 +137,25 @@ defmodule Whatsmeow.Session do
     # authenticated, keepalive-healthy, sending fine and receiving nothing —
     # with no log line anywhere. That state cost a clinic an evening.
     :active_iq,
+    # **When this socket became authenticated, and how many one-time pre-keys
+    # the server says it is holding for us.**
+    #
+    # Both exist for the same question, which nothing could answer: after a
+    # deploy, is this device down, or up and not being fed?
+    #
+    # A host reading `status: :authenticated` cannot tell a socket that logged
+    # in ninety seconds ago from one that logged in sixteen minutes late, and
+    # sixteen minutes late is what a lost lease race actually looked like in
+    # production. `logged_in_at` is the difference between those.
+    #
+    # `prekeys_on_server` is the other half. A peer that wants to send us a
+    # first message fetches a one-time pre-key from the server; with none left
+    # it cannot build a session, so it **skips us** — the message is never
+    # queued for this device and never arrives. From inside, that is
+    # indistinguishable from an idle chat: authenticated, keepalive-healthy,
+    # zero stanzas. Go asks the server for this count; this port never did.
+    :logged_in_at,
+    :prekeys_on_server,
     :auto_reconnect?,
     # QR-ref rotation: each `<pair-device>` IQ carries 4-6 refs.
     # The server expects the host UI to display them ONE AT A TIME,
@@ -527,7 +546,9 @@ defmodule Whatsmeow.Session do
        reconnect_attempts: state.reconnect_attempts,
        keepalive_failures: state.keepalive_failures,
        pending_count: map_size(state.pending),
-       active_iq: state.active_iq || :unsent
+       active_iq: state.active_iq || :unsent,
+       logged_in_at: state.logged_in_at,
+       prekeys_on_server: state.prekeys_on_server
      }, state}
   end
 
@@ -908,13 +929,54 @@ defmodule Whatsmeow.Session do
     # blocking IQ round-trip doesn't stall the Session mailbox.
     server = self()
     initial? = needs_initial_prekey_upload?(state.device)
+    device_id = state.device_id
 
     _ =
       Task.Supervisor.start_child(Whatsmeow.Media.TaskSup, fn ->
-        do_post_login_prekey_upload(server, initial?)
+        do_post_login_prekey_upload(server, initial?, device_id)
       end)
 
     {:noreply, state}
+  end
+
+  # **What the server says it is holding for us, kept where a host can read it.**
+  #
+  # The upload runs in a Task, so the number comes back as a message rather than
+  # a return value. It is the single most useful fact about a device that is
+  # authenticated and receiving nothing: at zero, no stranger can start a
+  # conversation with this number, and every other signal still reads healthy.
+  def handle_info({:prekeys_on_server, count}, state) when is_integer(count) do
+    if count < Whatsmeow.PreKeys.min_count() do
+      Logger.error(
+        "[whatsmeow] the server is holding #{count} pre-keys for this device. " <>
+          "Below #{Whatsmeow.PreKeys.min_count()} a peer with no existing session " <>
+          "cannot encrypt to us at all — their message is never sent and never queued.",
+        device_id: state.device_id
+      )
+    end
+
+    {:noreply, %{state | prekeys_on_server: count}}
+  end
+
+  # **The server telling us it is running low, which we used to decode and drop.**
+  #
+  # `Whatsmeow.Notification.decode_encrypt/2` has turned `<encrypt><count/></>`
+  # into a `%PreKeyCount{}` the whole time and nothing anywhere consumed it —
+  # the same shape as the `<ib>` offline preview: parsed, logged, never acted
+  # on. This is the server doing our monitoring for us, unprompted.
+  def handle_info({:prekey_count_notification, count}, state) when is_integer(count) do
+    server = self()
+    device_id = state.device_id
+
+    _ =
+      Task.Supervisor.start_child(Whatsmeow.Media.TaskSup, fn ->
+        case Whatsmeow.PreKeys.top_up(server, device_id: device_id) do
+          {:ok, :enough} -> :ok
+          _ -> refresh_prekey_count(server)
+        end
+      end)
+
+    {:noreply, %{state | prekeys_on_server: count}}
   end
 
   # The deadline fired. If the id is still pending, the server never answered —
@@ -1133,6 +1195,7 @@ defmodule Whatsmeow.Session do
         # ask "who are you?" even when we already know them by phone.
         _ = maybe_persist_lid_map(node)
         _ = maybe_persist_privacy_token(state, node)
+        _ = maybe_top_up_prekeys(state, node)
         state
       end
 
@@ -1526,6 +1589,37 @@ defmodule Whatsmeow.Session do
   end
 
   defp maybe_persist_privacy_token(_state, _node), do: :ok
+
+  # **`<notification type="encrypt"><count value="N"/></notification>` — the
+  # server telling us, unprompted, that our pre-key pool is running down.**
+  #
+  # `Whatsmeow.Notification` has decoded this into a `%PreKeyCount{}` since it
+  # was written and **nothing has ever consumed one**. Go tops up here. This
+  # port uploaded fifty keys once per login and never listened again, so a
+  # device that burned through them between deploys went quietly unreachable:
+  # peers with no session could not fetch a key, so they never encrypted to us,
+  # so no message was sent and none was queued — and every local signal
+  # (`status`, keepalive, `<active/>`) stayed green throughout.
+  #
+  # Handled by messaging ourselves rather than acting here: this runs inside the
+  # receive loop, and an IQ round-trip belongs off it.
+  defp maybe_top_up_prekeys(_state, %Binary.Node{attrs: %{"type" => "encrypt"}} = node) do
+    node
+    |> Whatsmeow.Notification.from_node()
+    |> Enum.each(fn
+      %Whatsmeow.Notification.PreKeyCount{value: n} when is_integer(n) ->
+        send(self(), {:prekey_count_notification, n})
+
+      _ ->
+        :ok
+    end)
+
+    :ok
+  rescue
+    _ -> :ok
+  end
+
+  defp maybe_top_up_prekeys(_state, _node), do: :ok
 
   # 463 = MessageAccountRestriction: we sent to a contact without a token they
   # trust. Ask the server to issue one so the *next* send lands. We deliberately
@@ -2104,6 +2198,7 @@ defmodule Whatsmeow.Session do
 
         state
         |> Map.put(:status, :authenticated)
+        |> Map.put(:logged_in_at, DateTime.utc_now())
         |> Map.put(:keepalive_failures, 0)
         # Authenticated, not merely connected — the only evidence that whatever
         # the server was refusing has stopped. `reconnect_attempts` joins it
@@ -2730,19 +2825,38 @@ defmodule Whatsmeow.Session do
 
   defp needs_initial_prekey_upload?(_), do: false
 
-  defp do_post_login_prekey_upload(server, initial?) do
-    case Whatsmeow.PreKeys.upload(server, initial?: initial?) do
+  defp do_post_login_prekey_upload(server, initial?, device_id) do
+    case Whatsmeow.PreKeys.upload_with_retry(server, initial?: initial?, device_id: device_id) do
       {:ok, %{uploaded: n}} ->
         Logger.info("[whatsmeow] post-login prekey upload OK", uploaded: n, initial?: initial?)
 
       {:error, reason} when reason in [:no_repo, :no_store] ->
         Logger.debug("[whatsmeow] skipping prekey upload — Repo not started")
 
-      {:error, reason} ->
-        Logger.warning("[whatsmeow] post-login prekey upload failed", reason: inspect(reason))
+      {:error, _reason} ->
+        :ok
     end
+
+    # **Asked after the upload, not instead of it.**
+    #
+    # The upload says what we pushed; this says what the server kept. They
+    # disagree more often than they should — a rejected IQ, a socket replaced
+    # mid-flight, an upload that raced a deploy — and only the second number
+    # decides whether a stranger can message this device.
+    refresh_prekey_count(server)
   rescue
     e -> Logger.warning("[whatsmeow] prekey upload crashed", reason: Exception.message(e))
+  end
+
+  defp refresh_prekey_count(server) do
+    case Whatsmeow.PreKeys.server_count(server) do
+      {:ok, count} -> send(server, {:prekeys_on_server, count})
+      {:error, _reason} -> :ok
+    end
+  rescue
+    _ -> :ok
+  catch
+    :exit, _ -> :ok
   end
 
   defp unpack_and_decode(plain) do

@@ -40,6 +40,8 @@ defmodule Whatsmeow.PreKeys do
   reference this `preKeyId`.
   """
 
+  require Logger
+
   alias Whatsmeow.Binary.Node
   alias Whatsmeow.Crypto.Curve25519
   alias Whatsmeow.IQ
@@ -141,6 +143,81 @@ defmodule Whatsmeow.PreKeys do
       ]
     )
   end
+
+  @doc """
+  Build the `<iq type="get" xmlns="encrypt"><count/></iq>` request.
+
+  The one question this library could not ask. Go sends this on connect and
+  after an upload; this port described the response shape in its own moduledoc
+  and never sent the stanza, so `upload/2` pushed fifty keys and assumed.
+  """
+  @spec build_count_iq(String.t() | nil) :: Node.t()
+  def build_count_iq(iq_id \\ nil) do
+    Node.new(
+      "iq",
+      %{
+        "id" => iq_id || IQ.generate_id(),
+        "to" => @server_jid,
+        "type" => "get",
+        "xmlns" => "encrypt"
+      },
+      [Node.new("count", %{}, nil)]
+    )
+  end
+
+  @doc """
+  How many one-time pre-keys the **server** is holding for us.
+
+  This is the number that decides whether a stranger can message this device at
+  all. A peer with no pre-key to fetch cannot complete X3DH, so it does not
+  encrypt to us and the message is never queued — from in here that is
+  indistinguishable from nobody having written.
+
+  `{:error, _}` rather than a guess, because a wrong number here would send
+  somebody to the wrong half of the system.
+  """
+  @spec server_count(pid() | String.t(), keyword()) :: {:ok, non_neg_integer()} | {:error, term()}
+  def server_count(server, opts \\ []) do
+    timeout = Keyword.get(opts, :timeout, 30_000)
+
+    case Session.send_iq(server, build_count_iq(), timeout) do
+      {:ok, %Node{} = response} -> read_count(response)
+      {:error, _} = err -> err
+    end
+  end
+
+  @doc """
+  The count out of an `<iq><count value="N"/></iq>` reply.
+
+  WhatsApp writes the number as an attribute here and as a binary child
+  elsewhere, so both are read. An attribute that is not a number is
+  `{:error, _}` and never zero — "the server says none left" and "we could not
+  read the server" are the two answers that must not be confused, because one
+  of them means every stranger is being turned away.
+  """
+  @spec read_count(Node.t()) :: {:ok, non_neg_integer()} | {:error, term()}
+  def read_count(%Node{} = response) do
+    case Node.get_child(response, "count") do
+      %Node{} = count -> count_value(count)
+      _ -> {:error, :no_count}
+    end
+  end
+
+  defp count_value(%Node{} = count) do
+    case Integer.parse(to_string(Node.attr(count, "value") || "")) do
+      {n, ""} when n >= 0 -> {:ok, n}
+      _ -> from_content(count.content)
+    end
+  end
+
+  # The binary-XML encoder writes a small integer as a big-endian binary in some
+  # places and as an attribute in others, and which one a given server build
+  # picks is not ours to decide. Reading both costs three lines.
+  defp from_content(content) when is_binary(content) and byte_size(content) in 1..4,
+    do: {:ok, :binary.decode_unsigned(content, :big)}
+
+  defp from_content(content) when is_integer(content) and content >= 0, do: {:ok, content}
+  defp from_content(_content), do: {:error, :unreadable_count}
 
   @doc false
   # Encode a one-time pre-key as `<key><id/><value/></key>`. The id is a
@@ -401,6 +478,94 @@ defmodule Whatsmeow.PreKeys do
 
         {:error, _} = err ->
           err
+      end
+    end
+  end
+
+  # A deploy is the worst moment to ask the server for anything, and it is the
+  # only moment this runs.
+  #
+  # The caller boots a container, logs in, and fires this from a `Task` that
+  # nothing waits on; the IQ's deadline is thirty seconds and the socket it
+  # travels on may be seconds old. One attempt, and the failure was a
+  # `Logger.warning` on a host whose log API answers 403.
+  #
+  # What that costs is not obvious and is the reason for the retry: a device
+  # whose upload failed still looks completely healthy. It is authenticated, it
+  # sends fine, its keepalives pass. It simply has no pre-keys for a stranger to
+  # fetch, so nobody can start a conversation with it — and the first anyone
+  # knows is a clinic saying the number stopped answering.
+  @upload_attempts 4
+  @upload_backoff_ms 2_000
+
+  @doc """
+  Upload, and keep trying — then say out loud what happened.
+
+  Backs off `@upload_backoff_ms` × attempt between tries, and emits
+  `[:whatsmeow, :prekeys, :uploaded]` or `[:whatsmeow, :prekeys, :failed]` so a
+  host can put the answer somewhere a person can read without log access.
+  """
+  @spec upload_with_retry(pid() | String.t(), keyword()) ::
+          {:ok, %{uploaded: non_neg_integer()}} | {:error, term()}
+  def upload_with_retry(server, opts \\ []), do: attempt_upload(server, opts, 1)
+
+  defp attempt_upload(server, opts, attempt) do
+    device_id = Keyword.get(opts, :device_id)
+
+    case upload(server, opts) do
+      {:ok, %{uploaded: n}} ->
+        :telemetry.execute(
+          [:whatsmeow, :prekeys, :uploaded],
+          %{count: n, attempts: attempt},
+          %{device_id: device_id, initial?: Keyword.get(opts, :initial?, false)}
+        )
+
+        {:ok, %{uploaded: n}}
+
+      {:error, reason} when attempt < @upload_attempts ->
+        Logger.warning(
+          "[whatsmeow] pre-key upload attempt #{attempt} failed: #{inspect(reason)} — " <>
+            "retrying. A device with no pre-keys on the server cannot be messaged " <>
+            "by anyone new, and looks perfectly healthy from in here.",
+          device_id: device_id
+        )
+
+        Process.sleep(@upload_backoff_ms * attempt)
+        attempt_upload(server, opts, attempt + 1)
+
+      {:error, reason} = err ->
+        :telemetry.execute(
+          [:whatsmeow, :prekeys, :failed],
+          %{attempts: attempt},
+          %{device_id: device_id, reason: reason}
+        )
+
+        Logger.error(
+          "[whatsmeow] pre-key upload failed #{attempt} times: #{inspect(reason)}. " <>
+            "Nobody new can start a conversation with this device until it succeeds.",
+          device_id: device_id
+        )
+
+        err
+    end
+  end
+
+  @doc """
+  Top up only if the server says we are short.
+
+  `{:ok, :enough}` when the count is at or above `min_count/0`, so the ordinary
+  case costs one IQ and no key generation. `{:error, _}` from the count is
+  **not** treated as "we are short": uploading fifty keys because a read failed
+  is how a transient blip becomes a write storm.
+  """
+  @spec top_up(pid() | String.t(), keyword()) ::
+          {:ok, :enough | %{uploaded: non_neg_integer()}} | {:error, term()}
+  def top_up(server, opts \\ []) do
+    with {:ok, count} <- server_count(server, opts) do
+      if count >= @min_count do
+        {:ok, :enough}
+      else
+        upload_with_retry(server, Keyword.put(opts, :initial?, false))
       end
     end
   end
