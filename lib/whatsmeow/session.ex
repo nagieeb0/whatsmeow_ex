@@ -90,6 +90,11 @@ defmodule Whatsmeow.Session do
   # which a clinic would notice nothing arriving.
   @active_iq_deadline_ms 15_000
 
+  # How long a connect waits for the pre-key pool to settle before sending
+  # `<active/>` regardless. A passive device receives nothing at all, so a hung
+  # upload must not be able to silence the number for ever.
+  @active_after_prekeys_ms 20_000
+
   @keepalive_base_ms 25_000
   @keepalive_jitter_ms 2_500
   # After 3 consecutive un-acked pings, force a reconnect.
@@ -286,6 +291,9 @@ defmodule Whatsmeow.Session do
           pending_count: non_neg_integer()
         }
   def info(server), do: GenServer.call(via_or_pid(server), :info)
+
+  @doc "How long a connect waits for the pre-key pool before going active anyway."
+  def active_after_prekeys_ms, do: @active_after_prekeys_ms
 
   @doc "Send a pre-built binary-XML `Node` over the wire. Returns `:ok` or `{:error, reason}`."
   @spec send_node(pid() | String.t(), Binary.Node.t()) :: :ok | {:error, term()}
@@ -928,18 +936,37 @@ defmodule Whatsmeow.Session do
     {:noreply, state}
   end
 
+  # **Pre-keys settled first, and `<active/>` only after — which is the order
+  # Go uses and this port had inverted.**
+  #
+  # `handleConnectSuccess` (`connectionevents.go:187-206`) runs one goroutine in
+  # strict sequence: count the pre-keys we hold, ask the server how many *it*
+  # holds, upload if either is short, **and only then** `SetPassive(false)`.
+  #
+  # This sent `<active/>` immediately and fired the pre-key work into a detached
+  # Task behind it, so the two raced on every single connect. `<active/>` is
+  # what tells the server to start flushing the offline queue, so the race was
+  # over the one stanza that governs whether anything is delivered at all — and
+  # a race resolves differently on a warm reconnect than on a container booting
+  # under deploy load, which is exactly the shape of a fault that only appears
+  # after a deploy.
+  #
+  # Measured in the failing state on 19 September: the server announced twelve
+  # queued messages, delivered none, and **never sent `<ib><offline/>`** to say
+  # the sync had finished. An offline sync that starts and never completes.
+  #
+  # The deadline below is not optional. A device that never becomes active
+  # receives nothing at all, so a pre-key upload that hangs must not be able to
+  # keep it passive for ever — it gets its turn, and then we go active anyway.
   def handle_info(:post_login_bootstrap, %__MODULE__{status: :authenticated} = state) do
-    # Send the post-login set-passive(false) + presence. The server
-    # quietly drops idle sessions if these don't show up shortly after
-    # <success>. Mirrors Go's `SetPassive` + `SendPresence` calls in
-    # `whatsmeow-main/connectionevents.go`.
     state =
-      state
-      |> send_active_iq()
-      |> send_node_or_log(
+      send_node_or_log(
+        state,
         IQ.build_presence(:available, push_name(state.device)),
         "presence"
       )
+
+    Process.send_after(self(), :go_active_anyway, @active_after_prekeys_ms)
 
     # Kick off async PreKey upload — runs in its own Task so the
     # blocking IQ round-trip doesn't stall the Session mailbox.
@@ -950,9 +977,30 @@ defmodule Whatsmeow.Session do
     _ =
       Task.Supervisor.start_child(Whatsmeow.Media.TaskSup, fn ->
         do_post_login_prekey_upload(server, initial?, device_id)
+        send(server, :go_active)
       end)
 
     {:noreply, state}
+  end
+
+  # Either the pre-key work finished or its deadline did. Whichever arrives
+  # first sends the stanza; the second is a no-op, because `active_iq` is only
+  # `nil`/`:unsent` before the first one runs.
+  def handle_info(reason, state) when reason in [:go_active, :go_active_anyway] do
+    if state.status == :authenticated and state.active_iq in [nil, :unsent] do
+      if reason == :go_active_anyway do
+        Logger.warning(
+          "[whatsmeow] going active without a settled pre-key pool — the upload " <>
+            "did not finish in #{@active_after_prekeys_ms}ms. A passive device " <>
+            "receives nothing, so this is the lesser of the two.",
+          device_id: state.device_id
+        )
+      end
+
+      {:noreply, send_active_iq(state)}
+    else
+      {:noreply, state}
+    end
   end
 
   # **What the server says it is holding for us, kept where a host can read it.**

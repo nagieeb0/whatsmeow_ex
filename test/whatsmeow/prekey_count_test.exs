@@ -74,6 +74,28 @@ defmodule Whatsmeow.PreKeyCountTest do
     end
   end
 
+  describe "the order the two post-login stanzas go out in" do
+    @doc """
+    **Pre-keys settle, then `<active/>` — and this port had it backwards.**
+
+    Go's `handleConnectSuccess` (`connectionevents.go:187-206`) is one goroutine
+    in strict sequence: count what we hold, ask the server what it holds, upload
+    if either is short, and only then `SetPassive(false)`.
+
+    This sent `<active/>` first and fired the pre-key work into a detached Task
+    behind it, so the two raced on every connect — over the one stanza that
+    tells the server to start flushing the offline queue. A race resolves
+    differently on a warm reconnect than on a container booting under deploy
+    load, which is the shape of a fault that only shows up after a deploy.
+    """
+    test "a device must not be left passive when the upload hangs" do
+      assert Whatsmeow.Session.active_after_prekeys_ms() > 0,
+             "a passive device receives nothing at all, so the wait for pre-keys " <>
+               "has to be bounded — the deadline is what stops a hung upload " <>
+               "from silencing the number for ever"
+    end
+  end
+
   describe "the warning the server sends unprompted" do
     # Decoded correctly since this module was written, and consumed by nothing —
     # the same shape as the `<ib>` offline preview before it was wired up.
