@@ -24,6 +24,36 @@ defmodule Whatsmeow.Types.Events do
     @type t :: %__MODULE__{device_id: String.t()}
   end
 
+  defmodule OfflineSyncPreview do
+    @moduledoc """
+    The server's own statement of what it queued while we were away.
+
+    Sent in an `<ib><offline_preview …/></ib>` shortly after login, and it is
+    the only place WhatsApp says how much it is about to deliver. A host that
+    receives seven messages' worth of preview and then writes no rows knows
+    the loss is on its side of the socket; one that is told zero knows the
+    server had nothing for it.
+
+    Without this the two are indistinguishable, and they have opposite fixes.
+    """
+    defstruct [:device_id, :total, :app_data_changes, :messages, :notifications, :receipts]
+
+    @type t :: %__MODULE__{
+            device_id: String.t(),
+            total: non_neg_integer(),
+            app_data_changes: non_neg_integer(),
+            messages: non_neg_integer(),
+            notifications: non_neg_integer(),
+            receipts: non_neg_integer()
+          }
+  end
+
+  defmodule OfflineSyncCompleted do
+    @moduledoc "`<ib><offline count=N/></ib>` — the queue has been drained."
+    defstruct [:device_id, :count]
+    @type t :: %__MODULE__{device_id: String.t(), count: non_neg_integer()}
+  end
+
   defmodule LoggedIn do
     @moduledoc """
     Authenticated post-handshake login — server replied `<success>` to our

@@ -85,6 +85,11 @@ defmodule Whatsmeow.Session do
   alias Whatsmeow.Types.Events
 
   # 25 s ± 2.5 s — comfortably under the server's ~30 s idle close.
+  # How long the server gets to answer the post-login `<active/>`. Fifteen
+  # seconds is far beyond a healthy round trip and well inside the window in
+  # which a clinic would notice nothing arriving.
+  @active_iq_deadline_ms 15_000
+
   @keepalive_base_ms 25_000
   @keepalive_jitter_ms 2_500
   # After 3 consecutive un-acked pings, force a reconnect.
@@ -124,6 +129,14 @@ defmodule Whatsmeow.Session do
     :reconnect_timer,
     :keepalive_timer,
     :keepalive_failures,
+    # **Did the server agree to start sending us messages?**
+    #
+    # `:unsent` → `:pending` → `:answered` | `:refused`. Go's `SetPassive` uses
+    # a blocking `sendIQ` and logs a failure; this port sent the same stanza
+    # fire-and-forget, so a rejected or unanswered `<active/>` left a session
+    # authenticated, keepalive-healthy, sending fine and receiving nothing —
+    # with no log line anywhere. That state cost a clinic an evening.
+    :active_iq,
     :auto_reconnect?,
     # QR-ref rotation: each `<pair-device>` IQ carries 4-6 refs.
     # The server expects the host UI to display them ONE AT A TIME,
@@ -513,7 +526,8 @@ defmodule Whatsmeow.Session do
        device_id: state.device_id,
        reconnect_attempts: state.reconnect_attempts,
        keepalive_failures: state.keepalive_failures,
-       pending_count: map_size(state.pending)
+       pending_count: map_size(state.pending),
+       active_iq: state.active_iq || :unsent
      }, state}
   end
 
@@ -884,7 +898,7 @@ defmodule Whatsmeow.Session do
     # `whatsmeow-main/connectionevents.go`.
     state =
       state
-      |> send_node_or_log(IQ.build_set_passive(false), "active IQ")
+      |> send_active_iq()
       |> send_node_or_log(
         IQ.build_presence(:available, push_name(state.device)),
         "presence"
@@ -901,6 +915,26 @@ defmodule Whatsmeow.Session do
       end)
 
     {:noreply, state}
+  end
+
+  # The deadline fired. If the id is still pending, the server never answered —
+  # which is not an error the protocol reports, and is the closest thing there
+  # is to "this device is authenticated and will not be fed".
+  def handle_info({:active_iq_deadline, id}, state) do
+    case Map.pop(state.pending, id) do
+      {:active_iq, pending} ->
+        Logger.error(
+          "[whatsmeow] the server never answered our post-login <active/> in " <>
+            "#{@active_iq_deadline_ms}ms — this device may be authenticated and " <>
+            "receive nothing",
+          device_id: state.device_id
+        )
+
+        {:noreply, %{state | pending: pending, active_iq: :unanswered}}
+
+      _ ->
+        {:noreply, state}
+    end
   end
 
   def handle_info(:post_login_bootstrap, state) do
@@ -2250,6 +2284,21 @@ defmodule Whatsmeow.Session do
         # Server acked our ping. Reset the failure counter.
         %{state | pending: pending, keepalive_failures: 0}
 
+      {:active_iq, pending} ->
+        outcome = if iq_type == "error", do: :refused, else: :answered
+
+        if outcome == :refused do
+          Logger.error(
+            "[whatsmeow] the server refused our post-login <active/> — this device " <>
+              "may stay authenticated and receive nothing",
+            device_id: state.device_id
+          )
+        else
+          Logger.info("[whatsmeow] post-login <active/> accepted", device_id: state.device_id)
+        end
+
+        %{state | pending: pending, active_iq: outcome}
+
       {{caller_pid, ref}, pending} when is_pid(caller_pid) ->
         Logger.debug(
           "[whatsmeow] iq response routed id=#{req_id} type=#{iq_type} pending=#{map_size(pending)}",
@@ -2372,26 +2421,53 @@ defmodule Whatsmeow.Session do
 
   defp maybe_answer_retry(state, _receipt), do: state
 
-  # Walk an `<ib>` info-broadcast and dispatch typed events for the
-  # children we recognise. Upstream Go (`connectionevents.go::handleIB`)
-  # silently ignores unknown children — we do the same. For now we
-  # only log; a future patch can broadcast `%Events.OfflineSyncPreview{}`
-  # etc. when the host needs them. Protocol-level: no ack required.
+  # Walk an `<ib>` info-broadcast and dispatch typed events for the children we
+  # recognise. Upstream Go (`connectionevents.go::handleIB`) silently ignores
+  # unknown children — we do the same. Protocol-level: no ack required.
+  #
+  # **This logged at `:debug` and broadcast nothing**, and the comment here said
+  # a future patch could send `%Events.OfflineSyncPreview{}` "when the host
+  # needs them". A host needed them: a clinic's number went deaf for hours with
+  # every other signal green, and the single number that would have settled it —
+  # how many messages WhatsApp thought it was delivering — was being written to
+  # a log the host could not read.
+  #
+  # `offline_preview` is the server's own statement of what it queued. A host
+  # that is told seven and then writes no rows knows the loss is on its side of
+  # the socket; one that is told zero knows the server had nothing to give it.
+  # Those have opposite fixes, and nothing else distinguishes them.
   defp on_ib(state, %Binary.Node{} = node) do
-    children =
-      case node.content do
-        list when is_list(list) -> Enum.map(list, &(&1.tag || :non_node))
-        _ -> []
-      end
+    notices = Whatsmeow.ConnectionEvents.decode_ib(node)
 
-    Logger.debug("[whatsmeow] <ib> received",
+    Logger.info("[whatsmeow] <ib> received",
       device_id: state.device_id,
       from: Binary.Node.attr(node, "from"),
-      children: inspect(children)
+      notices: inspect(notices)
     )
+
+    Enum.each(notices, &announce_ib(state, &1))
 
     state
   end
+
+  defp announce_ib(state, {:offline_preview, counts}) do
+    Whatsmeow.Notifications.broadcast(
+      state.device_id,
+      struct(Events.OfflineSyncPreview, Map.put(counts, :device_id, state.device_id))
+    )
+  end
+
+  defp announce_ib(state, {:offline_complete, count}) do
+    Whatsmeow.Notifications.broadcast(state.device_id, %Events.OfflineSyncCompleted{
+      device_id: state.device_id,
+      count: count
+    })
+  end
+
+  # `dirty` and `downgrade_webclient` are decoded and deliberately not
+  # broadcast: Go ignores the first and the second is about a pairing mode this
+  # library does not support.
+  defp announce_ib(_state, _other), do: :ok
 
   # Log helper for unknown server iqs. Promoted from debug → info
   # because "unhandled <iq>" is rare and worth seeing once during
@@ -2562,6 +2638,38 @@ defmodule Whatsmeow.Session do
 
   defp ok_or_keep({:ok, state2}, _orig), do: {:ok, state2}
   defp ok_or_keep({:error, _}, orig), do: {:ok, orig}
+
+  # **The one stanza that says "start sending me messages", and it was shouted
+  # into the dark.**
+  #
+  # Go's `SetPassive` is a blocking `sendIQ` that logs `"Failed to send
+  # post-connect passive IQ"`. This port used `send_node_or_log/3`, which only
+  # reports that the bytes left the socket — so a server that rejected the IQ,
+  # or never answered it, produced no line at all, and the session sat
+  # authenticated and unrouted looking perfectly healthy from every angle.
+  #
+  # Tracked now, so `info/1` can say `:answered`, `:pending` or `:refused`, and
+  # so a host with a deaf number has something to read other than silence. Not
+  # blocking: the bootstrap runs on the session's own mailbox and a server that
+  # never answers must not stall the process that reconnects it.
+  defp send_active_iq(state) do
+    id = IQ.generate_id()
+
+    case do_send_node(state, IQ.build_set_passive(false, id)) do
+      {:ok, state2} ->
+        Process.send_after(self(), {:active_iq_deadline, id}, @active_iq_deadline_ms)
+        %{state2 | active_iq: :pending, pending: Map.put(state2.pending, id, :active_iq)}
+
+      {:error, reason} ->
+        Logger.warning("[whatsmeow] post-login send failed",
+          device_id: state.device_id,
+          node: "active IQ",
+          reason: inspect(reason)
+        )
+
+        %{state | active_iq: :refused}
+    end
+  end
 
   # Send a node and log any transport error — used by bootstrap helpers
   # where we don't want a single failure to crash the GenServer.
