@@ -1209,6 +1209,20 @@ defmodule Whatsmeow.Session do
   defp on_message(state, %Binary.Node{} = msg) do
     own_jid = own_jid(state.device)
 
+    # **Counted the instant the stanza arrives, before anything can reject it.**
+    #
+    # Every other signal about an inbound message fires after parsing and after
+    # decrypt, so a stanza that dies in `MessageInfo.from_node/2` below is
+    # indistinguishable from one the server never sent — and the two are
+    # opposite problems. A host watching a device that announces thirty-five
+    # queued messages and decrypts none has no way, without this, to tell
+    # whether the bytes ever came.
+    :telemetry.execute(
+      [:whatsmeow, :session, :message_received],
+      %{system_time: System.system_time()},
+      %{device_id: state.device_id, from: Binary.Node.attr(msg, "from")}
+    )
+
     case Whatsmeow.MessageInfo.from_node(msg, own_jid) do
       {:ok, info} ->
         # The server volunteers the sender's other address on some stanzas and
@@ -1314,6 +1328,15 @@ defmodule Whatsmeow.Session do
         end
 
       {:error, reason} ->
+        # Telemetry as well as a log line: this is the one branch that consumes
+        # a message without ever reaching a decrypt event, so a host counting
+        # only decrypts sees the stanza vanish.
+        :telemetry.execute(
+          [:whatsmeow, :session, :message_rejected],
+          %{system_time: System.system_time()},
+          %{device_id: state.device_id, from: Binary.Node.attr(msg, "from"), reason: reason}
+        )
+
         Logger.warning("[whatsmeow] inbound <message> rejected",
           device_id: state.device_id,
           reason: inspect(reason)

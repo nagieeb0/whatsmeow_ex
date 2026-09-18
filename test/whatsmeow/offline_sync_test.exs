@@ -62,6 +62,51 @@ defmodule Whatsmeow.OfflineSyncTest do
     end
   end
 
+  describe "counting a stanza before anything can reject it" do
+    @doc """
+    Every other signal about an inbound message fires after parsing and after
+    decrypt. So a stanza rejected by `MessageInfo.from_node/2` looked exactly
+    like a stanza the server never sent — and those are opposite problems.
+
+    Measured live: a device announced thirty-five queued messages, reported the
+    server had accepted its `<active/>`, and decrypted none of them. Without a
+    count taken on arrival there was no way to say whether the bytes had come.
+    """
+    test "the arrival event names the device and the sender" do
+      ref =
+        :telemetry_test.attach_event_handlers(self(), [[:whatsmeow, :session, :message_received]])
+
+      on_exit(fn -> :telemetry.detach(ref) end)
+
+      :telemetry.execute(
+        [:whatsmeow, :session, :message_received],
+        %{system_time: System.system_time()},
+        %{device_id: "d1", from: "966501234567@s.whatsapp.net"}
+      )
+
+      assert_receive {[:whatsmeow, :session, :message_received], ^ref, _measure, meta}
+      assert meta.device_id == "d1"
+      assert meta.from == "966501234567@s.whatsapp.net"
+    end
+
+    # The branch that consumes a message without ever reaching a decrypt event.
+    test "and a rejected stanza says why" do
+      ref =
+        :telemetry_test.attach_event_handlers(self(), [[:whatsmeow, :session, :message_rejected]])
+
+      on_exit(fn -> :telemetry.detach(ref) end)
+
+      :telemetry.execute(
+        [:whatsmeow, :session, :message_rejected],
+        %{system_time: System.system_time()},
+        %{device_id: "d1", from: "x", reason: :no_sender}
+      )
+
+      assert_receive {[:whatsmeow, :session, :message_rejected], ^ref, _measure,
+                      %{reason: :no_sender}}
+    end
+  end
+
   describe "what the host receives" do
     setup do
       device_id = "offline-sync-#{System.unique_integer([:positive])}"
