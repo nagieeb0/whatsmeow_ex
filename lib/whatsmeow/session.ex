@@ -1059,6 +1059,26 @@ defmodule Whatsmeow.Session do
       {:ok, plain, ns2} ->
         case unpack_and_decode(plain) do
           {:ok, %Binary.Node{} = node} ->
+            # **Every stanza, by tag, at the last point before anything can
+            # route it away.**
+            #
+            # `:message_received` counts messages, and messages only. So a
+            # socket receiving a hundred receipts and no messages, and a socket
+            # receiving nothing at all, produce the identical reading — and they
+            # are opposite faults. One is a routing problem above this line; the
+            # other is a server that is not feeding this device.
+            #
+            # Measured on 19 September: WhatsApp announced eight queued messages
+            # in `<ib><offline_preview/>`, answered our `<active/>`, held
+            # twenty-five pre-keys for us, and delivered nothing for ninety
+            # seconds. Nothing anywhere could say whether the *socket* was idle
+            # or only the message path was.
+            :telemetry.execute(
+              [:whatsmeow, :session, :stanza],
+              %{system_time: System.system_time()},
+              %{device_id: state.device_id, tag: node.tag}
+            )
+
             dispatch_node(%{state | noise_socket: ns2}, node)
 
           {:error, reason} ->
