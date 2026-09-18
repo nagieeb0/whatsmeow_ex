@@ -1116,7 +1116,20 @@ defmodule Whatsmeow.Session do
 
             dispatch_node(%{state | noise_socket: ns2}, node)
 
+          # **Counted too, under a tag of its own.**
+          #
+          # A frame that decrypts and then fails to decode never reaches the
+          # tally above, so "bytes arrived and we could not read them" and
+          # "nothing arrived" were still one reading — the exact hole the tally
+          # was added to close, one layer further down. `#decode_failed` cannot
+          # collide with a real tag, because a real tag is a word.
           {:error, reason} ->
+            :telemetry.execute(
+              [:whatsmeow, :session, :stanza],
+              %{system_time: System.system_time()},
+              %{device_id: state.device_id, tag: "#decode_failed"}
+            )
+
             Logger.warning("[whatsmeow] binary-decode failed",
               device_id: state.device_id,
               reason: inspect(reason)
@@ -1125,7 +1138,16 @@ defmodule Whatsmeow.Session do
             %{state | noise_socket: ns2}
         end
 
+      # And the layer below that: a frame that will not even decrypt. Counted
+      # for the same reason — it is bytes on the wire, and the whole question
+      # has been whether any arrive.
       {:error, :auth_failed} ->
+        :telemetry.execute(
+          [:whatsmeow, :session, :stanza],
+          %{system_time: System.system_time()},
+          %{device_id: state.device_id, tag: "#decrypt_failed"}
+        )
+
         Logger.error("[whatsmeow] AEAD auth failed mid-stream — counter drift",
           device_id: state.device_id
         )
