@@ -1265,6 +1265,19 @@ defmodule Whatsmeow.Session do
   end
 
   defp dispatch_node(state, %Binary.Node{tag: "receipt"} = node) do
+    # Same reason as the `<ib>` children: five receipts land on every connect to
+    # this device and then nothing, and "a receipt" is not a fact you can act
+    # on. `type` is absent on a plain delivery receipt, which is itself the
+    # answer worth being able to see.
+    :telemetry.execute(
+      [:whatsmeow, :session, :stanza],
+      %{system_time: System.system_time()},
+      %{
+        device_id: state.device_id,
+        tag: "receipt/" <> (Binary.Node.attr(node, "type") || "delivery")
+      }
+    )
+
     receipt = Whatsmeow.Receipt.from_node(state.device_id, node)
 
     if receipt do
@@ -2680,6 +2693,24 @@ defmodule Whatsmeow.Session do
   # the socket; one that is told zero knows the server had nothing to give it.
   # Those have opposite fixes, and nothing else distinguishes them.
   defp on_ib(state, %Binary.Node{} = node) do
+    # **What the children actually are, not what we recognised.**
+    #
+    # `decode_ib/1` returns `[]` for any child it does not know, and that is the
+    # right behaviour — a future `<ib>` child must never stop a session. But it
+    # means an unrecognised notice is indistinguishable from no notice, and on
+    # this device the same four `<ib>` stanzas arrive on every single connect
+    # while exactly one of them (`offline_preview`) is understood.
+    #
+    # Tagged into the ordinary stanza tally, so whatever the other three are
+    # shows up on `/up/whatsapp` under its own name instead of being inferred.
+    for %Binary.Node{tag: tag} <- Binary.Node.children(node) do
+      :telemetry.execute(
+        [:whatsmeow, :session, :stanza],
+        %{system_time: System.system_time()},
+        %{device_id: state.device_id, tag: "ib/" <> tag}
+      )
+    end
+
     notices = Whatsmeow.ConnectionEvents.decode_ib(node)
 
     Logger.info("[whatsmeow] <ib> received",
