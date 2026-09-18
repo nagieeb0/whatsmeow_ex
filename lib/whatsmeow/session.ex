@@ -982,13 +982,6 @@ defmodule Whatsmeow.Session do
   # receives nothing at all, so a pre-key upload that hangs must not be able to
   # keep it passive for ever — it gets its turn, and then we go active anyway.
   def handle_info(:post_login_bootstrap, %__MODULE__{status: :authenticated} = state) do
-    state =
-      send_node_or_log(
-        state,
-        IQ.build_presence(:available, push_name(state.device)),
-        "presence"
-      )
-
     Process.send_after(self(), :go_active_anyway, @active_after_prekeys_ms)
 
     # Kick off async PreKey upload — runs in its own Task so the
@@ -1048,7 +1041,7 @@ defmodule Whatsmeow.Session do
           %{device_id: state.device_id}
         )
 
-        {:noreply, %{state | offline_expected: 0}}
+        {:noreply, announce_presence(%{state | offline_expected: 0})}
 
       true ->
         Logger.warning(
@@ -2818,7 +2811,10 @@ defmodule Whatsmeow.Session do
       Process.send_after(self(), :offline_sync_check, @offline_sync_grace_ms)
     end
 
-    %{state | offline_expected: expected, offline_arrived: 0, offline_pokes: 0}
+    state = %{state | offline_expected: expected, offline_arrived: 0, offline_pokes: 0}
+
+    # Nothing queued means nothing to wait for.
+    if expected == 0, do: announce_presence(state), else: state
   end
 
   defp announce_ib(state, {:offline_complete, count}) do
@@ -2827,14 +2823,39 @@ defmodule Whatsmeow.Session do
       count: count
     })
 
-    # The sync finished, so the watch is over whatever was delivered.
-    %{state | offline_expected: 0}
+    # The sync finished, so the watch is over whatever was delivered — and this
+    # is where presence goes out. See `announce_presence/1`.
+    announce_presence(%{state | offline_expected: 0})
   end
 
   # `dirty` and `downgrade_webclient` are decoded and deliberately not
   # broadcast: Go ignores the first and the second is about a pairing mode this
   # library does not support.
   defp announce_ib(state, _other), do: state
+
+  # **Sent after the offline queue, not racing it.**
+  #
+  # `<presence type="available"/>` tells WhatsApp this device is online *now*,
+  # and an online device is one the server expects to deliver to live — the
+  # offline queue is for a client that was away. This port sent it inside
+  # `post_login_bootstrap`, in the same breath as `<active/>`, so on every
+  # connect the "I am online" announcement raced the flush that `<active/>`
+  # had just asked for.
+  #
+  # **Go does not send presence on connect at all.** `connectionevents.go` has
+  # no reference to it; `SendPresence` is an explicit call a host makes, and its
+  # doc gives one reason — "so that the server has your pushname. Otherwise,
+  # other users will see '-' as the name."
+  #
+  # So it is still sent, because the pushname is worth having, and sent once the
+  # queue is settled. A race that resolves differently on a warm reconnect than
+  # on a container booting under deploy load is exactly the shape of a fault
+  # that only appears after a deploy — which is what this one does.
+  defp announce_presence(%__MODULE__{status: :authenticated} = state) do
+    send_node_or_log(state, IQ.build_presence(:available, push_name(state.device)), "presence")
+  end
+
+  defp announce_presence(state), do: state
 
   # Log helper for unknown server iqs. Promoted from debug → info
   # because "unhandled <iq>" is rare and worth seeing once during
