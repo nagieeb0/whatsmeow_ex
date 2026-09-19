@@ -20,10 +20,18 @@ defmodule Whatsmeow.Media.Finch do
   the full ciphertext in memory.
 
       Whatsmeow.Media.Finch.stream_get(url, fn
-        {:status, code}, acc -> {:ok, %{acc | status: code}}
-        {:headers, h}, acc -> {:ok, %{acc | headers: h}}
-        {:data, chunk}, acc -> {:ok, %{acc | size: acc.size + byte_size(chunk)}}
+        {:status, code}, acc -> %{acc | status: code}
+        {:headers, h}, acc -> %{acc | headers: h}
+        {:data, chunk}, acc -> %{acc | size: acc.size + byte_size(chunk)}
       end, %{status: 0, headers: [], size: 0})
+
+  **The reducer returns the accumulator itself, bare.** `stream_get/2` is
+  `Finch.stream/5`, which adds the `{:cont, _}` for you; only
+  `Finch.stream_while/5` takes a reducer that wraps its own return. Getting
+  this backwards does not raise on the first message — it raises on the
+  first `{:data, _}`, several frames later, as a `BadMapError` naming an
+  accumulator nested inside two `:cont` tuples. That shipped, and it broke
+  every media download and every history sync on every host.
 
   ## Streaming upload
 
@@ -84,8 +92,13 @@ defmodule Whatsmeow.Media.Finch do
       {:data, chunk}, acc -> {:cont, %{acc | body: [acc.body, chunk]}}
     end
 
-    case Finch.build(:get, url, headers) |> Finch.stream(@finch_name, acc0, fun) do
+    case Finch.build(:get, url, headers) |> Finch.stream_while(@finch_name, acc0, fun) do
       {:ok, %{status: status, body: iodata}} -> {:ok, status, iodata}
+      # `stream_while/5` reports a failure as a *three*-tuple carrying whatever
+      # had been collected before it. `stream/5` does not, so this clause never
+      # existed and a mid-transfer error arrived at `fetch_one/2` as a shape its
+      # `case` had no clause for — a second, quieter version of the same bug.
+      {:error, error, _partial} -> {:error, error}
       err -> err
     end
   end

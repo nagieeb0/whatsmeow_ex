@@ -86,8 +86,8 @@ defmodule Whatsmeow.Send.Group do
 
   * `:registration_id` — outbound SenderKey id. Defaults to the device's.
   * `:message_id` — override generated message id.
-  * `:bundle_timeout` — per-device PreKey bundle fetch timeout (default 30 s).
-  * `:device_timeout` — `<usync>` device-resolution timeout (default 30 s).
+  * `:bundle_timeout` — per-device PreKey bundle fetch timeout (default 5 s).
+  * `:device_timeout` — `<usync>` device-resolution timeout (default 10 s).
 
   Returns `{:ok, message_id}` on success.
   """
@@ -278,7 +278,7 @@ defmodule Whatsmeow.Send.Group do
   end
 
   defp resolve_devices(server, participants, %Device{} = device, opts) do
-    timeout = Keyword.get(opts, :device_timeout, 30_000)
+    timeout = Keyword.get(opts, :device_timeout, 10_000)
 
     case User.get_user_devices(server, participants, timeout: timeout) do
       {:ok, devices} ->

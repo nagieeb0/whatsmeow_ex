@@ -26,6 +26,7 @@ defmodule Whatsmeow.Send do
   alias Whatsmeow.Store.Schemas.Device
   alias Whatsmeow.Types.JID
   alias Whatsmeow.User
+  alias Whatsmeow.User.DeviceCache
 
   @typedoc "Things that can go wrong on `send_text/3`."
   @type send_error ::
@@ -297,7 +298,7 @@ defmodule Whatsmeow.Send do
       |> WAWebProtobufsE2E.Message.encode()
       |> IO.iodata_to_binary()
 
-    timeout = Keyword.get(opts, :device_timeout, 30_000)
+    timeout = Keyword.get(opts, :device_timeout, 10_000)
 
     with {:ok, all_devices} <-
            User.get_user_devices(server, [peer_jid, JID.to_non_ad(our_ad_jid)], timeout: timeout),
@@ -717,7 +718,7 @@ defmodule Whatsmeow.Send do
         |> WAWebProtobufsE2E.Message.encode()
         |> IO.iodata_to_binary()
 
-      timeout = Keyword.get(opts, :device_timeout, 30_000)
+      timeout = Keyword.get(opts, :device_timeout, 10_000)
 
       with {:ok, all_devices} <-
              User.get_user_devices(server, [own_non_ad], timeout: timeout),
@@ -1184,39 +1185,68 @@ defmodule Whatsmeow.Send do
 
     case locked do
       :no_session ->
-        timeout = Keyword.get(opts, :bundle_timeout, 30_000)
+        timeout = Keyword.get(opts, :bundle_timeout, 5_000)
 
-        with {:ok, bundle} <- fetch_prekey_bundle(server, peer, timeout) do
-          case WireEncrypt.encrypt_prekey_envelope(
-                 plaintext,
-                 device.identity_key,
-                 device.registration_id,
-                 bundle
-               ) do
-            {:ok, envelope, sess} ->
-              _ =
-                Whatsmeow.Signal.Decrypt.stash_identity_pub(
-                  device.jid,
-                  their_id,
-                  bundle.identity_pub
-                )
-
-              # Take the lock for the write alone. The bundle fetch above had to
-              # stay outside it; the store itself must not.
-              _ =
-                Lock.with_session(device.jid, their_id, fn ->
-                  Decrypt.persist_session(device.jid, their_id, sess)
-                end)
-
-              {:ok, envelope, "pkmsg", sess}
-
-            {:error, reason} ->
-              {:error, {:encrypt, reason}}
-          end
+        # **A device that had no bundle a minute ago still has none.**
+        #
+        # Asked here rather than inside `fetch_prekey_bundle/3` so the skip is
+        # free: no IQ, no thirty-second wait, no log line per message. The
+        # session lookup above still runs, which is correct — it is local, and a
+        # companion that came back via an inbound `pkmsg` has a session now and
+        # never reaches this branch at all.
+        if DeviceCache.no_bundle?(peer) do
+          {:error, :no_bundle}
+        else
+          fetch_and_encrypt(server, device, peer, their_id, plaintext, timeout)
         end
 
       result ->
         result
+    end
+  end
+
+  defp fetch_and_encrypt(server, %Device{} = device, %JID{} = peer, their_id, plaintext, timeout) do
+    case fetch_prekey_bundle(server, peer, timeout) do
+      {:ok, bundle} ->
+        case WireEncrypt.encrypt_prekey_envelope(
+               plaintext,
+               device.identity_key,
+               device.registration_id,
+               bundle
+             ) do
+          {:ok, envelope, sess} ->
+            _ =
+              Whatsmeow.Signal.Decrypt.stash_identity_pub(
+                device.jid,
+                their_id,
+                bundle.identity_pub
+              )
+
+            # Take the lock for the write alone. The bundle fetch above had to
+            # stay outside it; the store itself must not.
+            _ =
+              Lock.with_session(device.jid, their_id, fn ->
+                Decrypt.persist_session(device.jid, their_id, sess)
+              end)
+
+            {:ok, envelope, "pkmsg", sess}
+
+          {:error, reason} ->
+            {:error, {:encrypt, reason}}
+        end
+
+      # **Only this exact answer is remembered.**
+      #
+      # `:no_bundle` means the server completed the round-trip and declined to
+      # name the device — the signature of a companion nobody can address any
+      # more. A timeout or a transport error says nothing about the device and
+      # must not be cached, or one bad minute silences a live phone for fifteen.
+      {:error, :no_bundle} = err ->
+        DeviceCache.note_no_bundle(peer)
+        err
+
+      {:error, _} = err ->
+        err
     end
   end
 

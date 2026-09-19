@@ -1225,10 +1225,38 @@ defmodule Whatsmeow.Session do
     state = Enum.reduce(framed, state, &decrypt_and_dispatch/2)
 
     case state.status do
-      :stopping -> {:stop, :normal, state}
-      _ -> process_ws_frames(state, rest)
+      :stopping ->
+        {:stop, :normal, state}
+
+      # **A disconnect ends this batch too, not just a stop.**
+      #
+      # `handle_disconnect/2` leaves `:disconnected`, never `:stopping`, so the
+      # old clause fell through to `_` and recursed into the remaining websocket
+      # payloads holding a `noise_socket` that is now `nil`. Every one of them
+      # was decrypted against a closed socket.
+      :disconnected ->
+        {:noreply, state}
+
+      _ ->
+        process_ws_frames(state, rest)
     end
   end
+
+  # **The socket can close halfway through a batch of frames.**
+  #
+  # `Frame.read_frames/1` splits one websocket payload into many stanzas, and
+  # WhatsApp routinely coalesces them. When one of those stanzas is
+  # `<stream:error code="515">` — the *normal* first reconnect after pairing —
+  # `act_on_stream_error/2` calls `handle_disconnect/2`, which sets
+  # `noise_socket: nil`. `Enum.reduce/3` knows nothing about that and handed the
+  # next frame of the same batch to `NoiseSocket.decrypt(nil, …)`, which has no
+  # `nil` clause: `FunctionClauseError`, and the whole session GenServer died on
+  # every re-pair.
+  #
+  # Dropping the rest of the batch is correct rather than merely safe. Those
+  # frames were encrypted under a counter this socket no longer has; the
+  # reconnect re-reads whatever mattered.
+  defp decrypt_and_dispatch(_ciphertext, %__MODULE__{noise_socket: nil} = state), do: state
 
   defp decrypt_and_dispatch(ciphertext, %__MODULE__{noise_socket: ns} = state) do
     case NoiseSocket.decrypt(ns, ciphertext) do
@@ -2350,6 +2378,22 @@ defmodule Whatsmeow.Session do
         # Persist if the store is reachable; tolerate absent Repo (tests).
         _ = maybe_persist_device(result.device)
 
+        # **The device list from the previous pairing is now a lie.**
+        #
+        # `DeviceCache` is keyed by the JID's user part alone and holds entries
+        # for an hour, and the only thing that ever invalidated it was a
+        # `<notification type="devices">` for one specific peer. Pairing — the
+        # one moment when *our own* account's device list is guaranteed stale —
+        # touched it not at all.
+        #
+        # The visible cost was not subtle: after a re-pair every outbound message
+        # fanned out to the companions of the *old* pairing, each of which took a
+        # Postgres advisory lock and a blocking prekey IQ before failing with
+        # `:no_bundle`, and the message did not leave until all of them had
+        # finished failing. `clear/0` has existed and been documented for this
+        # the whole time; nothing in `lib/` had ever called it.
+        Whatsmeow.User.DeviceCache.clear()
+
         # Update in-memory device so the next reconnect uses login_payload.
         state = %{state | device: result.device}
 
@@ -3306,7 +3350,15 @@ defmodule Whatsmeow.Session do
 
     with {:ok, %Device{jid: jid}} when is_binary(jid) <- get_device(server),
          {:ok, %J{} = ours} <- J.parse(jid),
-         {:ok, devices} <- Whatsmeow.User.get_user_devices(server, [J.to_non_ad(ours)]) do
+         # **`cache: false`, or this asks itself instead of the server.**
+         #
+         # The whole worth of this check is that it runs the *same* `usync` a
+         # sender runs, so the answer is the list every peer will use. Served
+         # from `DeviceCache` it was the list our own previous login wrote —
+         # which after a re-pair is exactly the stale answer that made this log
+         # line unreadable: four devices, none of them the one we just became.
+         {:ok, devices} <-
+           Whatsmeow.User.get_user_devices(server, [J.to_non_ad(ours)], cache: false) do
       listed? = Enum.any?(devices, &(&1.device == ours.device and &1.user == ours.user))
       send(server, {:own_devices, {length(devices), listed?}})
     end

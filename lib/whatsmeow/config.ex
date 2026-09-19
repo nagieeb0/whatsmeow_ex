@@ -51,11 +51,20 @@ defmodule Whatsmeow.Config do
 
   @doc """
   Per-fanout-task timeout in ms (used as `:timeout` on `Task.async_stream`
-  for the send fanout). Defaults to 60 s — comfortably above the 30 s
-  default `:bundle_timeout` so a single slow prekey-bundle IQ doesn't
-  kill the whole fanout.
+  for the send fanout). Defaults to 15 s — comfortably above the 5 s default
+  `:bundle_timeout` so a single slow prekey-bundle IQ does not kill the whole
+  fanout.
+
+  ## Why these numbers came down
+
+  They were 60 s over 30 s, which is a batch-job budget on an interactive path.
+  The fanout is drained in full before the stanza goes out, so every one of
+  these seconds is a second the patient spends looking at a clinic that has not
+  answered. A device that has not produced a prekey bundle in five seconds is
+  not going to save this message; the reply going out to the devices that did
+  answer is worth more than waiting for the one that did not.
   """
   @spec fanout_task_timeout_ms() :: pos_integer()
   def fanout_task_timeout_ms,
-    do: Application.get_env(:whatsmeow_ex, :fanout_task_timeout_ms, 60_000)
+    do: Application.get_env(:whatsmeow_ex, :fanout_task_timeout_ms, 15_000)
 end

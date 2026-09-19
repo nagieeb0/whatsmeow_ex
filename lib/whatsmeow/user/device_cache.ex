@@ -34,6 +34,11 @@ defmodule Whatsmeow.User.DeviceCache do
   @table :whatsmeow_device_cache
   @ttl_ms 60 * 60 * 1000
 
+  # Devices the server declined to hand out a prekey bundle for. Short-lived on
+  # purpose — see `no_bundle?/1`.
+  @gap_table :whatsmeow_bundle_gap
+  @gap_ttl_ms 15 * 60 * 1000
+
   # --- Supervisor entry ------------------------------------------------------
 
   def child_spec(opts) do
@@ -138,6 +143,56 @@ defmodule Whatsmeow.User.DeviceCache do
   @spec clear() :: :ok
   def clear do
     with :ok <- ensure_table(), do: :ets.delete_all_objects(@table)
+    with :ok <- ensure_gap_table(), do: :ets.delete_all_objects(@gap_table)
+    :ok
+  rescue
+    _ -> :ok
+  end
+
+  # --- Devices with no prekey bundle -----------------------------------------
+
+  @doc """
+  Whether `ad_jid` recently answered a prekey request with nothing.
+
+  ## Why this is worth a second table
+
+  A companion that has been unlinked does not disappear from the account's
+  device list; the server simply stops naming it in a prekey response. Every
+  send to that account then opens a first-contact path for it: a Postgres
+  advisory-lock transaction, then a **blocking** prekey IQ, then `:no_bundle`,
+  logged and dropped. Nothing remembered the answer, so the next message paid it
+  again — and because the fanout is fully drained before the stanza goes out,
+  the *live* devices waited for the dead ones to finish failing.
+
+  Fifteen minutes, not an hour. This is a negative answer, and a negative answer
+  is the one you want to stop trusting quickly: a device that comes back — a
+  re-link, a reinstall, a server blip — should cost at most one quarter-hour of
+  silence, not a working day.
+
+  Keyed by the **full** address including the device id, because this is a fact
+  about one companion and not about the person.
+  """
+  @spec no_bundle?(JID.t() | String.t()) :: boolean()
+  def no_bundle?(ad_jid) do
+    with key when is_binary(key) <- gap_key(ad_jid),
+         :ok <- ensure_gap_table(),
+         [{^key, stored_at}] <- :ets.lookup(@gap_table, key) do
+      now_ms() - stored_at < @gap_ttl_ms
+    else
+      _ -> false
+    end
+  rescue
+    _ -> false
+  end
+
+  @doc "Remember that `ad_jid` has no prekey bundle."
+  @spec note_no_bundle(JID.t() | String.t()) :: :ok
+  def note_no_bundle(ad_jid) do
+    with key when is_binary(key) <- gap_key(ad_jid),
+         :ok <- ensure_gap_table() do
+      :ets.insert(@gap_table, {key, now_ms()})
+    end
+
     :ok
   rescue
     _ -> :ok
@@ -148,6 +203,7 @@ defmodule Whatsmeow.User.DeviceCache do
   @impl true
   def init(_opts) do
     create_table()
+    create_gap_table()
     {:ok, %{}}
   end
 
@@ -164,21 +220,41 @@ defmodule Whatsmeow.User.DeviceCache do
 
   defp cache_key(_), do: nil
 
+  # The *full* address, device id and all — the opposite of `cache_key/1`, and
+  # deliberately so. A device list belongs to a person; a missing prekey bundle
+  # belongs to one companion of theirs.
+  defp gap_key(%JID{} = jid), do: JID.to_string(jid)
+
+  defp gap_key(s) when is_binary(s) do
+    case JID.parse(s) do
+      {:ok, %JID{} = jid} -> gap_key(jid)
+      _ -> nil
+    end
+  end
+
+  defp gap_key(_), do: nil
+
   defp fresh?(stored_at), do: now_ms() - stored_at < @ttl_ms
 
   defp now_ms, do: System.monotonic_time(:millisecond)
 
-  defp ensure_table do
-    case :ets.whereis(@table) do
-      :undefined -> create_table()
+  defp ensure_table, do: ensure(@table, &create_table/0)
+  defp ensure_gap_table, do: ensure(@gap_table, &create_gap_table/0)
+
+  defp ensure(table, create) do
+    case :ets.whereis(table) do
+      :undefined -> create.()
       _ -> :ok
     end
 
     :ok
   end
 
-  defp create_table do
-    :ets.new(@table, [
+  defp create_table, do: create(@table)
+  defp create_gap_table, do: create(@gap_table)
+
+  defp create(table) do
+    :ets.new(table, [
       :named_table,
       :public,
       :set,
