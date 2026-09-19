@@ -2504,7 +2504,7 @@ defmodule Whatsmeow.Session do
         # file — it was simply wired to `<stream:error code=500>` instead, which
         # is `:internal_server_error`. So the one failure with a known automatic
         # fix was the one that never got it.
-        trigger_wa_version_refresh_async(state.device_id)
+        trigger_wa_version_refresh_async(state.device_id, "<failure 405 client-outdated>")
         retry_after_failure(state, reason)
 
       :retry ->
@@ -2582,7 +2582,7 @@ defmodule Whatsmeow.Session do
     # reconnect's ClientPayload picks up the live revision. Without this
     # the session loops forever inside the reconnect backoff while
     # WAVersion.Refresher waits for its next hourly tick.
-    if code == "500", do: trigger_wa_version_refresh_async(state.device_id)
+    if code == "500", do: trigger_wa_version_refresh_async(state.device_id, "<stream:error 500>")
 
     act_on_stream_error(state, ConnectionEvents.decode_stream_error(node))
   end
@@ -2616,17 +2616,48 @@ defmodule Whatsmeow.Session do
     end
   end
 
-  defp trigger_wa_version_refresh_async(device_id) do
+  # **A refresh that changed nothing used to report success.**
+  #
+  # Measured in production on 19 September:
+  #
+  #     client version {2, 3000, 1047935283}
+  #     <failure> reason=:client_outdated attrs=%{"reason" => "405"}
+  #     forcing WAVersion.refresh/1 (client-outdated auto-recovery)
+  #     WAVersion refreshed to {2, 3000, 1047935283} after stream:error 500
+  #
+  # Two lies in four lines. It "refreshed" to **the version it already had**,
+  # and it blamed a `stream:error 500` when the trigger was a `<failure 405>`.
+  # So "the recovery worked" and "the recovery was a no-op" read identically,
+  # and the one fact worth having was buried: WhatsApp says this client is
+  # outdated *and* the newest published version is the one we are already
+  # pinned to. Those two together mean the 405 is not about the version at all,
+  # and no amount of refreshing will fix it.
+  #
+  # The connect recovers anyway on the next attempt, so this costs one wasted
+  # handshake per deploy rather than an outage — which is exactly why it would
+  # have gone on being invisible.
+  defp trigger_wa_version_refresh_async(device_id, cause) do
+    before = Whatsmeow.WAVersion.cached()
+
     Task.Supervisor.start_child(Whatsmeow.Media.TaskSup, fn ->
       Logger.warning(
-        "[whatsmeow] forcing WAVersion.refresh/1 (client-outdated auto-recovery)",
+        "[whatsmeow] forcing WAVersion.refresh/1 after #{cause} (was #{inspect(before)})",
         device_id: device_id
       )
 
       case Whatsmeow.WAVersion.refresh(timeout: 30_000) do
+        {:ok, ^before} ->
+          Logger.error(
+            "[whatsmeow] WAVersion refresh returned the SAME version #{inspect(before)} after " <>
+              "#{cause}. WhatsApp calls this client outdated and the newest published version " <>
+              "is the one already pinned — so the rejection is not about the version, and " <>
+              "refreshing will never fix it.",
+            device_id: device_id
+          )
+
         {:ok, version} ->
           Logger.warning(
-            "[whatsmeow] WAVersion refreshed to #{inspect(version)} after stream:error 500",
+            "[whatsmeow] WAVersion moved #{inspect(before)} → #{inspect(version)} after #{cause}",
             device_id: device_id
           )
 
