@@ -2827,6 +2827,17 @@ defmodule Whatsmeow.Session do
       struct(Events.OfflineSyncPreview, Map.put(counts, :device_id, state.device_id))
     )
 
+    # **Answer the offer.** `<offline_preview>` announces a queue and delivers
+    # nothing; the server waits to be asked. See `IQ.build_offline_batch/1` —
+    # not asking is the whole post-deploy outage, and it is invisible from every
+    # other reading because the socket is genuinely healthy.
+    #
+    # Unconditionally, including when the preview says zero messages: the count
+    # is a preview of *items*, of which messages are one kind, and a queue of
+    # pure notifications still has to be drained or it is offered again on the
+    # next connect for ever.
+    state = send_node_or_log(state, IQ.build_offline_batch(), "offline_batch")
+
     expected = Map.get(counts, :messages, 0)
 
     if expected > 0 do
@@ -3117,7 +3128,12 @@ defmodule Whatsmeow.Session do
         state2
 
       {:error, reason} ->
-        Logger.warning("[whatsmeow] post-login send failed",
+        # The label is in the *message*, not only in the metadata. Which stanza
+        # failed to go out is the entire content of this line, and metadata
+        # renders or does not depending on a formatter config — so on the one
+        # host whose logs are hard to read it was "post-login send failed" with
+        # no subject.
+        Logger.warning("[whatsmeow] post-login send failed node=#{label}",
           device_id: state.device_id,
           node: label,
           reason: inspect(reason)

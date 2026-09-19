@@ -127,6 +127,37 @@ defmodule Whatsmeow.IQ do
   end
 
   @doc """
+  Ask the server to start sending the offline queue it just announced.
+
+  ## The stanza the whole post-deploy outage was missing
+
+  `<ib><offline_preview count="48" message="5"/></ib>` is an **offer**, not a
+  delivery. Baileys answers it with `<ib><offline_batch count="100"/></ib>`, and
+  `amarula` — an independent Elixir client that works — carries the comment:
+
+  > *"reply `<ib><offline_batch count="100"/></ib>` **or the server never
+  > delivers the queued offline messages**."*
+
+  This library read the preview, broadcast an event about it, armed a timer to
+  notice nothing arrived, and never asked. So on every connect after a gap the
+  server offered a queue, waited to be asked, and was not — which reads on every
+  instrument as a socket that is perfectly healthy and simply not being fed:
+  keepalives answered, `<active/>` accepted, receipts flowing, twenty-one IQs
+  answered, `received: 0` for ever.
+
+  Re-sending `passive`/`active` could never have fixed it, because the server
+  was not waiting on a state change. It was waiting for a question.
+
+  `count` is how many items to send in this batch, and 100 is Baileys' value.
+  """
+  @spec build_offline_batch(pos_integer()) :: Node.t()
+  def build_offline_batch(count \\ 100) do
+    Node.new("ib", %{}, [
+      Node.new("offline_batch", %{"count" => Integer.to_string(count)}, nil)
+    ])
+  end
+
+  @doc """
   `<iq type="get" xmlns="encrypt"><digest/></iq>` — ask the server to validate
   our key bundle.
 

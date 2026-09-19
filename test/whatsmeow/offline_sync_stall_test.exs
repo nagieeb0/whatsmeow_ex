@@ -49,7 +49,9 @@ defmodule Whatsmeow.OfflineSyncStallTest do
 
   test "zero announced is not a stall, it is an empty queue" do
     assert [{:offline_preview, %{messages: 0}}] =
-             CE.decode_ib(ib([Node.new("offline_preview", %{"count" => "0", "message" => "0"}, nil)]))
+             CE.decode_ib(
+               ib([Node.new("offline_preview", %{"count" => "0", "message" => "0"}, nil)])
+             )
   end
 
   describe "the wire form of the restart" do
