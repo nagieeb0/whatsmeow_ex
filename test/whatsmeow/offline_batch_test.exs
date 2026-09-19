@@ -104,6 +104,43 @@ defmodule Whatsmeow.OfflineBatchTest do
       assert log =~ "offline_batch"
     end
 
+    @doc """
+    **A queue of pure receipts is still a queue.**
+
+    The stall watch was armed on the preview's message count. The connect that
+    exposed this announced `messages="0" count="115"` — a hundred and fifteen
+    receipts and notifications and not one message — so nothing watched it, and
+    when it stopped ten items short of the end there was no timer to notice.
+
+    A receipt that never arrives is a read marker the clinic's own screen never
+    gets, and an undrained queue is re-offered on every connect for ever.
+    """
+    test "a queue with no messages in it is still watched" do
+      state =
+        capture_state(fn ->
+          Session.__dispatch_node__(state("dev-4"), preview(%{"count" => "115", "message" => "0"}))
+        end)
+
+      assert state.offline_expected == 115,
+             "the queue is the queue — gating the watch on messages left 115 items unwatched"
+    end
+
+    test "and an empty one is watched by nothing, because there is nothing to wait for" do
+      state =
+        capture_state(fn ->
+          Session.__dispatch_node__(state("dev-5"), preview(%{"count" => "0", "message" => "0"}))
+        end)
+
+      assert state.offline_expected == 0
+    end
+
+    # The sends fail with no transport and log about it, which is not what these
+    # two are measuring.
+    defp capture_state(fun) do
+      {result, _log} = with_log(fun)
+      result
+    end
+
     test "an <ib> that is not a preview asks for nothing" do
       log =
         capture_log(fn ->

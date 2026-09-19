@@ -1024,14 +1024,23 @@ defmodule Whatsmeow.Session do
       state.status != :authenticated or state.offline_expected == 0 ->
         {:noreply, state}
 
-      state.offline_arrived > 0 ->
-        {:noreply, %{state | offline_expected: 0}}
-
+      # **"Something arrived" used to end the watch, and that is not the same
+      # fact as "the queue is empty".**
+      #
+      # It was a reasonable terminator while the failure being watched for was
+      # a flush that never started — under that fault, one stanza meant the
+      # server had begun feeding us and the rest would follow. It is the wrong
+      # terminator for the one actually measured: a queue of 115 that delivered
+      # about 105 and stopped ten short. `offline_arrived` was well above zero,
+      # so this branch cancelled the watch on a sync that had not finished.
+      #
+      # The queue is over when the server says it is over — `<ib><offline/>`,
+      # which `announce_ib/2` turns into `offline_expected: 0`. Nothing else.
       state.offline_pokes >= @offline_sync_pokes ->
         Logger.error(
-          "[whatsmeow] the server announced #{state.offline_expected} queued messages " <>
-            "and delivered none after #{state.offline_pokes} attempts to restart the " <>
-            "sync. This device is authenticated and will not be fed; it needs re-pairing.",
+          "[whatsmeow] the server announced #{state.offline_expected} queued items " <>
+            "and never finished the flush after #{state.offline_pokes} further batch " <>
+            "requests. Live delivery is unaffected; the remainder stays with WhatsApp.",
           device_id: state.device_id
         )
 
@@ -1043,18 +1052,27 @@ defmodule Whatsmeow.Session do
 
         {:noreply, announce_presence(%{state | offline_expected: 0})}
 
+      # **Ask again, rather than re-announcing ourselves.**
+      #
+      # This used to re-send `passive` then `active`, on the theory that the
+      # server had stopped feeding a device it considered away. It never once
+      # worked, and the transcript says why: the server is not waiting on our
+      # state, it is waiting to be asked for a batch. `offline_batch` carries
+      # `count="100"` — Baileys' number, and the one proven on this wire — so a
+      # queue longer than that needs the question repeated.
+      #
+      # Measured: a queue of 115 delivered about 105 and stopped with the
+      # per-stanza `offline=` counter still above zero and no `<ib><offline/>`
+      # to end it. That is the shape this branch now exists for.
       true ->
         Logger.warning(
-          "[whatsmeow] #{state.offline_expected} queued messages announced and none " <>
-            "delivered — re-sending passive/active to restart the sync " <>
+          "[whatsmeow] #{state.offline_expected} queued items announced and the flush " <>
+            "has not finished — asking for another batch " <>
             "(attempt #{state.offline_pokes + 1}/#{@offline_sync_pokes})",
           device_id: state.device_id
         )
 
-        state =
-          state
-          |> send_node_or_log(IQ.build_set_passive(true, IQ.generate_id()), "passive")
-          |> send_active_iq()
+        state = send_node_or_log(state, IQ.build_offline_batch(), "offline_batch")
 
         Process.send_after(self(), :offline_sync_check, @offline_sync_grace_ms)
         {:noreply, %{state | offline_pokes: state.offline_pokes + 1}}
@@ -2838,7 +2856,17 @@ defmodule Whatsmeow.Session do
     # next connect for ever.
     state = send_node_or_log(state, IQ.build_offline_batch(), "offline_batch")
 
-    expected = Map.get(counts, :messages, 0)
+    # **`total`, not `messages`.**
+    #
+    # This watch was armed on the message count, and the queue that exposed the
+    # bug announced `messages="0" count="115"` — a hundred and fifteen receipts
+    # and notifications and not one message. So nothing watched it, and when it
+    # stopped ten items short of the end there was no timer to notice.
+    #
+    # The queue is the queue. A receipt that never arrives is a read marker the
+    # clinic's own screen never gets, and an undrained queue is re-offered on
+    # every connect for ever.
+    expected = Map.get(counts, :total, 0)
 
     if expected > 0 do
       Process.send_after(self(), :offline_sync_check, @offline_sync_grace_ms)
