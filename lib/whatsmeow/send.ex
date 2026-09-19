@@ -306,6 +306,19 @@ defmodule Whatsmeow.Send do
          :ok <- guard_have_devices(devices) do
       our_bare_user = our_ad_jid.user
 
+      # **One prekey IQ for the whole fanout, not one per device.**
+      #
+      # `IQ.build_prekeys_get/2` has always taken a list — upstream Go asks for
+      # every sessionless device in a single `<iq xmlns="encrypt">` — and this
+      # asked for one JID at a time, inside a `Task.async_stream` worker, with
+      # the whole stanza blocked until the slowest of them answered.
+      #
+      # It is an optimisation with a fallback and not a new path: anything the
+      # batch does not cover falls through to the per-device fetch below
+      # unchanged, so a response in a shape we do not recognise costs a round
+      # trip rather than a message.
+      opts = Keyword.put(opts, :bundles, prefetch_bundles(server, device, devices, opts, timeout))
+
       {participant_nodes, any_pkmsg} =
         parallel_fanout(devices, fn ad_jid ->
           pt = if ad_jid.user == our_bare_user, do: dsm_plaintext, else: plaintext
@@ -429,6 +442,88 @@ defmodule Whatsmeow.Send do
 
     Node.new("device-identity", %{}, bytes)
   end
+
+  # **Which devices actually need a bundle, asked once, answered once.**
+  #
+  # A device with a live Signal session needs nothing, and must not be asked:
+  # fetching a bundle *consumes* one of the peer's one-time prekeys, so an
+  # unconditional batch would burn their keys to learn what we already knew.
+  #
+  # The local session lookup is repeated inside `encrypt_plaintext_for_peer/5`
+  # a moment later. That is deliberate — it is an indexed read against Postgres
+  # on the same node, and trading one of those for N websocket round-trips to
+  # WhatsApp is the entire point.
+  defp prefetch_bundles(server, %Device{} = device, devices, opts, timeout) do
+    case Enum.filter(devices, &wants_bundle?(device, &1, opts)) do
+      [] -> %{}
+      [_single] -> %{}
+      peers -> batch_bundles(server, peers, timeout)
+    end
+  end
+
+  # One device is not a batch — asking here would only move the same round trip
+  # earlier and lose the `Task` that was carrying it.
+  defp wants_bundle?(%Device{} = device, %JID{} = peer, opts) do
+    cond do
+      DeviceCache.no_bundle?(peer) -> false
+      Keyword.get(opts, :force_new_session, false) -> true
+      true -> load_session(device.jid, Address.session_key(peer)) == :not_found
+    end
+  rescue
+    # A store that is not up is not a reason to skip the send; the per-device
+    # path will reach the same conclusion on its own.
+    _ -> false
+  end
+
+  defp batch_bundles(server, peers, timeout) do
+    iq = IQ.build_prekeys_get(Enum.map(peers, &JID.to_string/1))
+
+    case Session.send_iq(server, iq, timeout) do
+      {:ok, response} -> bundles_from_response(peers, response)
+      # The IQ itself failed. Say nothing about any device — every one of them
+      # falls through to the per-device fetch, exactly as before.
+      _ -> %{}
+    end
+  rescue
+    _ -> %{}
+  catch
+    :exit, _ -> %{}
+  end
+
+  @doc """
+  One `<iq>` of prekey bundles, indexed by the device each belongs to.
+
+  Public because it carries the two decisions worth asserting and neither is
+  reachable through `send_text/3`: that the index is **device-aware**, and that
+  a device we asked about and the server did not name is `:no_bundle` rather
+  than missing.
+  """
+  @spec bundles_from_response([JID.t()], Node.t()) :: map()
+  def bundles_from_response(peers, response) do
+    {:ok, pairs} = PreKeyBundle.from_iq_response(response)
+
+    answered = Map.new(pairs, fn {jid, result} -> {bundle_key(jid), result} end)
+
+    # **A device we asked about and the server did not name has no bundle.**
+    #
+    # That is the same `:no_bundle` the single fetch derives from an empty
+    # `pick_bundle/2`, and deriving it here is what keeps an unlinked companion
+    # from costing an extra round trip on the first message of every
+    # conversation.
+    Enum.reduce(peers, answered, fn peer, acc ->
+      Map.put_new(acc, bundle_key(peer), {:error, :no_bundle})
+    end)
+  rescue
+    # A response in a shape we do not recognise says nothing about any device.
+    # Every one of them falls through to the per-device fetch, as before.
+    _ -> %{}
+  end
+
+  # Device-aware, unlike `pick_bundle/2`'s `jids_match?/2`. That one compares
+  # the user part alone, which is right when a response concerns one device and
+  # silently wrong when it concerns four of the same person's.
+  defp bundle_key(%JID{user: user, device: device}), do: {user, device || 0}
+  defp bundle_key(_jid), do: nil
 
   defp strip_self_and_hosted(devices, %JID{user: own_user, device: own_device}) do
     Enum.reject(devices, fn ad ->
@@ -1197,7 +1292,22 @@ defmodule Whatsmeow.Send do
         if DeviceCache.no_bundle?(peer) do
           {:error, :no_bundle}
         else
-          fetch_and_encrypt(server, device, peer, their_id, plaintext, timeout)
+          # The batch above answered for this device, or it did not. Both are
+          # ordinary: `nil` simply means ask, which is what always happened.
+          case Map.get(Keyword.get(opts, :bundles, %{}), bundle_key(peer)) do
+            %PreKeyBundle{} = bundle ->
+              encrypt_with_bundle(device, their_id, plaintext, bundle)
+
+            {:error, :no_bundle} ->
+              DeviceCache.note_no_bundle(peer)
+              {:error, :no_bundle}
+
+            {:error, reason} ->
+              {:error, {:bundle_error, reason}}
+
+            nil ->
+              fetch_and_encrypt(server, device, peer, their_id, plaintext, timeout)
+          end
         end
 
       result ->
@@ -1208,32 +1318,7 @@ defmodule Whatsmeow.Send do
   defp fetch_and_encrypt(server, %Device{} = device, %JID{} = peer, their_id, plaintext, timeout) do
     case fetch_prekey_bundle(server, peer, timeout) do
       {:ok, bundle} ->
-        case WireEncrypt.encrypt_prekey_envelope(
-               plaintext,
-               device.identity_key,
-               device.registration_id,
-               bundle
-             ) do
-          {:ok, envelope, sess} ->
-            _ =
-              Whatsmeow.Signal.Decrypt.stash_identity_pub(
-                device.jid,
-                their_id,
-                bundle.identity_pub
-              )
-
-            # Take the lock for the write alone. The bundle fetch above had to
-            # stay outside it; the store itself must not.
-            _ =
-              Lock.with_session(device.jid, their_id, fn ->
-                Decrypt.persist_session(device.jid, their_id, sess)
-              end)
-
-            {:ok, envelope, "pkmsg", sess}
-
-          {:error, reason} ->
-            {:error, {:encrypt, reason}}
-        end
+        encrypt_with_bundle(device, their_id, plaintext, bundle)
 
       # **Only this exact answer is remembered.**
       #
@@ -1247,6 +1332,34 @@ defmodule Whatsmeow.Send do
 
       {:error, _} = err ->
         err
+    end
+  end
+
+  # X3DH against a bundle, however it arrived — the batch above or the
+  # per-device fetch. Extracted so the two cannot drift: the identity stash and
+  # the session write are not optional extras, and a second copy of this is a
+  # second place to forget one of them.
+  defp encrypt_with_bundle(%Device{} = device, their_id, plaintext, bundle) do
+    case WireEncrypt.encrypt_prekey_envelope(
+           plaintext,
+           device.identity_key,
+           device.registration_id,
+           bundle
+         ) do
+      {:ok, envelope, sess} ->
+        _ = Whatsmeow.Signal.Decrypt.stash_identity_pub(device.jid, their_id, bundle.identity_pub)
+
+        # Take the lock for the write alone. The bundle fetch had to stay
+        # outside it; the store itself must not.
+        _ =
+          Lock.with_session(device.jid, their_id, fn ->
+            Decrypt.persist_session(device.jid, their_id, sess)
+          end)
+
+        {:ok, envelope, "pkmsg", sess}
+
+      {:error, reason} ->
+        {:error, {:encrypt, reason}}
     end
   end
 
