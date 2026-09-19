@@ -1160,6 +1160,12 @@ defmodule Whatsmeow.Send do
         mimetype: Keyword.get(opts, :mime_type, "audio/ogg; codecs=opus"),
         seconds: Keyword.get(opts, :duration_seconds),
         PTT: kind == :voice,
+        # The bars on the bubble. WhatsApp draws them from these bytes and
+        # nothing else: without the field a voice note renders as a flat line,
+        # which reads as a broken recording before anybody presses play.
+        # 64 bytes, each an amplitude 0..100 — the caller measures them, since
+        # only the caller has the audio before it was encrypted.
+        waveform: Keyword.get(opts, :waveform),
         mediaKeyTimestamp: System.os_time(:second)
       }
     }

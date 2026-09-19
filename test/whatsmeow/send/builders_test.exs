@@ -118,4 +118,33 @@ defmodule Whatsmeow.Send.BuildersTest do
       refute a.messageContextInfo.messageSecret == b.messageContextInfo.messageSecret
     end
   end
+
+  describe "voice notes" do
+    @upload %{
+      url: "https://mmg.whatsapp.net/x",
+      direct_path: "/x",
+      media_key: <<1::256>>,
+      file_sha256: <<2::256>>,
+      file_enc_sha256: <<3::256>>,
+      file_length: 4_096
+    }
+
+    # The bars WhatsApp draws under a voice note come from this field alone.
+    # It was not being set, so every voice note this library sent rendered flat.
+    test "carry the waveform they were given" do
+      bars = :binary.copy(<<40>>, 64)
+
+      msg = Send.build_media_message_proto(:voice, @upload, waveform: bars, duration_seconds: 7)
+
+      assert msg.audioMessage.waveform == bars
+      assert msg.audioMessage.seconds == 7
+      assert Map.fetch!(msg.audioMessage, :PTT)
+    end
+
+    test "and are content to have none" do
+      msg = Send.build_media_message_proto(:voice, @upload, [])
+
+      assert msg.audioMessage.waveform == nil
+    end
+  end
 end
