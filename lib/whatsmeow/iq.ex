@@ -158,6 +158,44 @@ defmodule Whatsmeow.IQ do
   end
 
   @doc """
+  Clear the server's dirty flag: `<iq type="set" xmlns="urn:xmpp:whatsapp:dirty">`.
+
+  ## The same shape as `build_offline_batch/1`, one layer up
+
+  `<ib><dirty type="account_sync" timestamp="…"/></ib>` arrives on every connect
+  to this device and was decoded, logged and dropped — on the reasoning that Go
+  ignores it too (`connectionevents.go:91` has `MarkNotDirty` commented out).
+
+  That reasoning is exactly what kept `offline_batch` missing for eight
+  hypotheses: Go is a different client, and "Go gets away without it" is not
+  "the server does not want it". `amarula` — which works — sends it, and says:
+
+  > *"Baileys `CB:ib,,dirty` (chats.ts): clear the server's dirty sync flag …
+  > **Until this is acked the server keeps the companion's sync paused.**"*
+
+  `timestamp` echoes the server's when it gave one; Baileys omits it otherwise.
+  """
+  @spec build_clean_dirty(String.t(), integer() | nil, String.t() | nil) :: Node.t()
+  def build_clean_dirty(type, timestamp \\ nil, id \\ nil) when is_binary(type) do
+    attrs =
+      case timestamp do
+        nil -> %{"type" => type}
+        ts -> %{"type" => type, "timestamp" => to_string(ts)}
+      end
+
+    Node.new(
+      "iq",
+      %{
+        "id" => id || generate_id(),
+        "to" => server_jid(),
+        "type" => "set",
+        "xmlns" => "urn:xmpp:whatsapp:dirty"
+      },
+      [Node.new("clean", attrs, nil)]
+    )
+  end
+
+  @doc """
   `<iq type="get" xmlns="encrypt"><digest/></iq>` — ask the server to validate
   our key bundle.
 

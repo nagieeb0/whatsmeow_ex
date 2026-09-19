@@ -2861,9 +2861,24 @@ defmodule Whatsmeow.Session do
     announce_presence(%{state | offline_expected: 0})
   end
 
-  # `dirty` and `downgrade_webclient` are decoded and deliberately not
-  # broadcast: Go ignores the first and the second is about a pairing mode this
-  # library does not support.
+  # **Answer the dirty flag, for the reason `offline_batch` had to be answered.**
+  #
+  # This clause used to say "Go ignores it" and drop the notice, citing
+  # `MarkNotDirty` being commented out in `connectionevents.go:91`. That is the
+  # same reasoning that left `<ib><offline_preview/></ib>` unanswered through
+  # eight hypotheses and eight deploys: Go is a different client with a
+  # different feature set, and *"Go gets away without it"* is not *"the server
+  # does not want it"*.
+  #
+  # `amarula`, which works, sends it and says why: **until it is acked the
+  # server keeps the companion's sync paused.** That is the live candidate for
+  # the history sync this device has never received.
+  defp announce_ib(state, {:dirty, type, timestamp}) when is_binary(type) do
+    send_node_or_log(state, IQ.build_clean_dirty(type, timestamp), "clean_dirty")
+  end
+
+  # `downgrade_webclient` is decoded and deliberately not broadcast: it is about
+  # a pairing mode this library does not support.
   defp announce_ib(state, _other), do: state
 
   # **Sent after the offline queue, not racing it.**
