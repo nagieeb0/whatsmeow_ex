@@ -141,6 +141,42 @@ defmodule Whatsmeow.OfflineBatchTest do
       result
     end
 
+    @doc """
+    **Ask for the whole queue, not for a hundred of it.**
+
+    Baileys hardcodes `count="100"` and so did this, and a real queue of 207
+    then drained in three batches with a twenty-five second stall timer between
+    each — because nothing signals the end of a batch except stanzas stopping.
+
+    Measured on 19 September: items flowed 02:22:32–34, silence, poke at
+    02:22:56, items again, silence, poke at 02:23:21, finished. **Forty-nine
+    seconds** to hand over about five seconds of actual transfer, every second
+    of it a clinic that has just deployed and is not yet hearing its patients.
+
+    The server has just said how many it holds. Asking for that many costs the
+    same single stanza.
+    """
+    test "the request is sized to what the server just announced" do
+      log =
+        capture_log(fn ->
+          Session.__dispatch_node__(
+            state("dev-207"),
+            preview(%{"count" => "207", "message" => "3"})
+          )
+        end)
+
+      assert log =~ "offline_batch"
+
+      assert [%Node{attrs: %{"count" => "207"}}] = Node.children(IQ.build_offline_batch(207))
+    end
+
+    # A small queue still asks for at least Baileys' number — there is no reason
+    # to ask for four and then be surprised by a fifth.
+    test "and never for fewer than the hundred Baileys asks for" do
+      assert [%Node{attrs: %{"count" => "100"}}] =
+               Node.children(IQ.build_offline_batch(max(100, 4)))
+    end
+
     test "an <ib> that is not a preview asks for nothing" do
       log =
         capture_log(fn ->

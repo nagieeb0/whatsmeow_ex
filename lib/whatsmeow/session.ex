@@ -2885,7 +2885,26 @@ defmodule Whatsmeow.Session do
     # is a preview of *items*, of which messages are one kind, and a queue of
     # pure notifications still has to be drained or it is offered again on the
     # next connect for ever.
-    state = send_node_or_log(state, IQ.build_offline_batch(), "offline_batch")
+    #
+    # **And ask for the whole queue, not for a hundred of it.**
+    #
+    # Baileys hardcodes `count="100"` and so did this, and a queue of 207 then
+    # drained in three batches — with a **twenty-five second stall timer between
+    # each**, because nothing tells us a batch has ended except stanzas stopping.
+    # Measured on 19 September: items flowed 02:22:32–34, silence, poke at
+    # 02:22:56, items again, silence, poke at 02:23:21, finished. Forty-nine
+    # seconds to hand over about five seconds of actual transfer.
+    #
+    # That window is a clinic which has just deployed and is not yet hearing its
+    # patients, and it is the thing this system is judged on hardest. The server
+    # has just told us how many it holds; asking for that many costs the same
+    # single stanza. The poke stays as the fallback for a server that caps us.
+    state =
+      send_node_or_log(
+        state,
+        IQ.build_offline_batch(max(100, Map.get(counts, :total, 0))),
+        "offline_batch"
+      )
 
     # **`total`, not `messages`.**
     #
