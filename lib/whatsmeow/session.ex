@@ -3067,8 +3067,28 @@ defmodule Whatsmeow.Session do
     framed = Frame.wrap(ct)
 
     case state.transport.send_binary(state.transport_conn, framed) do
-      {:ok, conn2} -> {:ok, %{state | noise_socket: ns2, transport_conn: conn2}}
-      {:error, _} = err -> err
+      {:ok, conn2} ->
+        # **Both halves of the conversation, or it is not a conversation.**
+        #
+        # The inbound tally found the offline-batch bug; the first thing wanted
+        # after that was "did our `clean_dirty` go out and what came back", and
+        # a one-sided transcript cannot answer it. An IQ result is meaningless
+        # without the request it answers.
+        :telemetry.execute(
+          [:whatsmeow, :session, :stanza],
+          %{system_time: System.system_time()},
+          %{
+            device_id: state.device_id,
+            tag: "out/" <> node.tag,
+            sketch: Binary.Node.sketch(node),
+            direction: :out
+          }
+        )
+
+        {:ok, %{state | noise_socket: ns2, transport_conn: conn2}}
+
+      {:error, _} = err ->
+        err
     end
   end
 
