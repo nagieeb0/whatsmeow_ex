@@ -67,4 +67,97 @@ defmodule Whatsmeow.Binary.Node do
   def attr(%__MODULE__{attrs: attrs}, key, default \\ nil) when is_binary(key) do
     Map.get(attrs, key, default)
   end
+
+  # Attributes worth seeing when you are trying to work out what a server
+  # answered, and no others. `from`, `to`, `participant`, `jid`, `recipient`
+  # and `notify` are all either a patient's number or their name.
+  @sketch_attrs ~w(type xmlns reason code class text count offline t)
+
+  @sketch_children 3
+
+  @doc """
+  A short, printable, **redacted** summary of this stanza.
+
+  ## Why this exists
+
+  Every hypothesis about the post-deploy offline-sync stall died against a
+  measurement, and each measurement cost a deploy — because the only readings
+  available were counts. `stanzas: %{"iq" => 21}` says twenty-one IQs were
+  answered and cannot say *which*, so "the server ignored our `digest`" and
+  "the server answered it and something else is wrong" produce identical
+  output. CranL answers with an HTML page on its logs API, so the log lines
+  that would distinguish them are not reachable from anywhere.
+
+  This turns the next hypothesis into a reading instead of a deploy.
+
+  ## Redaction is the whole reason it is a function and not `inspect/1`
+
+  The summary is served by an authenticated health endpoint, which means it
+  leaves the machine. A stanza carries patient phone numbers in `from`, `to`,
+  `participant` and `jid`, a patient's WhatsApp display name in `notify`, and
+  a message body in its content — so the allowlist is over attribute *keys*,
+  and content is never included at any depth. A denylist would be one new
+  attribute away from publishing a phone number.
+
+      iex> Whatsmeow.Binary.Node.sketch(%Whatsmeow.Binary.Node{
+      ...>   tag: "iq",
+      ...>   attrs: %{"type" => "result", "from" => "966501234567@s.whatsapp.net"},
+      ...>   content: [%Whatsmeow.Binary.Node{tag: "list", attrs: %{"xmlns" => "blocklist"}}]
+      ...> })
+      "iq[type=result](list[xmlns=blocklist])"
+  """
+  @spec sketch(t()) :: String.t()
+  def sketch(%__MODULE__{} = node) do
+    node.tag <> attrs_of(node) <> children_of(node)
+  end
+
+  defp attrs_of(%__MODULE__{attrs: attrs}) do
+    @sketch_attrs
+    |> Enum.flat_map(fn key ->
+      case Map.get(attrs, key) do
+        nil -> []
+        value -> ["#{key}=#{printable(value)}"]
+      end
+    end)
+    |> case do
+      [] -> ""
+      pairs -> "[" <> Enum.join(pairs, ",") <> "]"
+    end
+  end
+
+  defp children_of(%__MODULE__{content: children}) when is_list(children) do
+    shown = Enum.take(children, @sketch_children)
+    more = length(children) - length(shown)
+
+    inner =
+      shown
+      |> Enum.map(&(&1.tag <> attrs_of(&1)))
+      |> Enum.join(",")
+
+    suffix = if more > 0, do: ",+#{more}", else: ""
+
+    case inner <> suffix do
+      "" -> ""
+      body -> "(" <> body <> ")"
+    end
+  end
+
+  defp children_of(%__MODULE__{}), do: ""
+
+  # A JID can appear under an allowlisted key on some stanzas, and an integer
+  # or boolean under others. Anything that is not a short plain word is
+  # reduced to its type rather than printed.
+  defp printable(value) when is_integer(value) or is_boolean(value), do: to_string(value)
+
+  defp printable(value) when is_binary(value) do
+    cond do
+      String.contains?(value, "@") -> "<jid>"
+      String.match?(value, ~r/^\d{7,}$/) -> "<num>"
+      String.length(value) > 32 -> "<long>"
+      true -> value
+    end
+  end
+
+  defp printable(%{__struct__: _}), do: "<jid>"
+  defp printable(_other), do: "<?>"
 end

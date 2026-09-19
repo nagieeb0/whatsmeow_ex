@@ -1231,10 +1231,20 @@ defmodule Whatsmeow.Session do
             # twenty-five pre-keys for us, and delivered nothing for ninety
             # seconds. Nothing anywhere could say whether the *socket* was idle
             # or only the message path was.
+            # `sketch` alongside the tag, not instead of it. The tally answers
+            # "how much", which is what a rate question needs; the sketch
+            # answers "what did the server actually say", which is what every
+            # dead hypothesis about the offline stall needed and none of them
+            # could get. It is redacted at the source — see `Binary.Node.sketch/1`
+            # for why the allowlist is over attribute keys.
             :telemetry.execute(
               [:whatsmeow, :session, :stanza],
               %{system_time: System.system_time()},
-              %{device_id: state.device_id, tag: node.tag}
+              %{
+                device_id: state.device_id,
+                tag: node.tag,
+                sketch: Binary.Node.sketch(node)
+              }
             )
 
             dispatch_node(%{state | noise_socket: ns2}, node)
