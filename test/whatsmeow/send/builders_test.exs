@@ -147,4 +147,95 @@ defmodule Whatsmeow.Send.BuildersTest do
       assert msg.audioMessage.waveform == nil
     end
   end
+
+  describe "edit_attribute/1 — Go's getEditAttribute (send.go:1030)" do
+    test "a reaction with empty text is a revoke, not an empty reaction" do
+      msg = Send.build_reaction("12345@s.whatsapp.net", nil, "MSG1", "")
+      assert Send.edit_attribute(msg) == "7"
+    end
+
+    test "an ordinary reaction carries no edit attribute" do
+      msg = Send.build_reaction("12345@s.whatsapp.net", nil, "MSG1", "\u{1F440}")
+      assert Send.edit_attribute(msg) == nil
+    end
+
+    test "revoking our own message is a sender revoke" do
+      msg = Send.build_revoke("12345@s.whatsapp.net", nil, "MSG1")
+      assert Send.edit_attribute(msg) == "7"
+    end
+
+    test "revoking someone else's message as admin is an admin revoke" do
+      {:ok, peer} = JID.parse("99999@s.whatsapp.net")
+      msg = Send.build_revoke("group@g.us", peer, "MSG1")
+      assert Send.edit_attribute(msg) == "8"
+    end
+
+    test "an edit is a message edit" do
+      new_body = %WAWebProtobufsE2E.Message{conversation: "edited body"}
+      msg = Send.build_edit("12345@s.whatsapp.net", "ORIG-ID", new_body)
+      assert Send.edit_attribute(msg) == "1"
+    end
+
+    test "plain text has none" do
+      assert Send.edit_attribute(%WAWebProtobufsE2E.Message{conversation: "hi"}) == nil
+    end
+  end
+
+  describe "enc_attrs/3 — decrypt-fail (Go send.go:1195-1200)" do
+    test "a reaction tells the peer to stay silent if it cannot decrypt" do
+      msg = Send.build_reaction("12345@s.whatsapp.net", nil, "MSG1", "\u{1F440}")
+      assert Send.enc_attrs("reaction", msg, nil) == %{"decrypt-fail" => "hide"}
+    end
+
+    test "so does anything carrying an edit attribute" do
+      msg = Send.build_reaction("12345@s.whatsapp.net", nil, "MSG1", "")
+      assert Send.enc_attrs("reaction", msg, "7") == %{"decrypt-fail" => "hide"}
+    end
+
+    test "plain text does not" do
+      assert Send.enc_attrs("text", %WAWebProtobufsE2E.Message{conversation: "hi"}, nil) == %{}
+    end
+  end
+
+  describe "build_message_key/4 — naming ourselves (Go send.go:494)" do
+    test "our phone number as sender is still fromMe" do
+      {:ok, own} = JID.parse("12345@s.whatsapp.net")
+      key = Send.build_message_key("99999@s.whatsapp.net", own, "MSG1", ["12345", "77777"])
+      assert key.fromMe == true
+      assert key.participant == nil
+    end
+
+    test "our LID as sender is still fromMe" do
+      {:ok, own_lid} = JID.parse("77777@lid")
+      key = Send.build_message_key("99999@lid", own_lid, "MSG1", ["12345", "77777"])
+      assert key.fromMe == true
+    end
+
+    test "a peer is still not us" do
+      {:ok, peer} = JID.parse("99999@s.whatsapp.net")
+      key = Send.build_message_key("99999@s.whatsapp.net", peer, "MSG1", ["12345", "77777"])
+      assert key.fromMe == false
+    end
+
+    test "no own users means the old behaviour" do
+      {:ok, own} = JID.parse("12345@s.whatsapp.net")
+      assert Send.build_message_key("99999@s.whatsapp.net", own, "MSG1").fromMe == false
+    end
+  end
+
+  describe "own_users/1" do
+    test "both identities, bare" do
+      device = %Whatsmeow.Store.Schemas.Device{
+        jid: "12345.0:3@s.whatsapp.net",
+        lid: "77777.0:3@lid"
+      }
+
+      assert Send.own_users(device) == ["12345", "77777"]
+    end
+
+    test "a device paired before the LID was stored yields just the phone number" do
+      device = %Whatsmeow.Store.Schemas.Device{jid: "12345.0:3@s.whatsapp.net", lid: nil}
+      assert Send.own_users(device) == ["12345"]
+    end
+  end
 end

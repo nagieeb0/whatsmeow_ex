@@ -251,11 +251,21 @@ defmodule Whatsmeow do
           String.t(),
           keyword()
         ) :: {:ok, String.t()} | {:error, term()}
+  # arch: documented by the `@doc` above; unchanged arity, body only.
   def send_reaction(session, chat, sender, message_id, emoji, opts \\ []) do
+    # Our own users go in so that reacting to a message of ours — naming
+    # ourselves as `sender` rather than passing `nil` — still builds a
+    # `fromMe: true` key. See `Whatsmeow.Send.own_users/1`.
+    own =
+      case Whatsmeow.Session.get_device(session) do
+        {:ok, device} -> Whatsmeow.Send.own_users(device)
+        _ -> []
+      end
+
     send_message(
       session,
       chat,
-      Whatsmeow.Send.build_reaction(chat, sender, message_id, emoji),
+      Whatsmeow.Send.build_reaction(chat, sender, message_id, emoji, own),
       opts
     )
   end

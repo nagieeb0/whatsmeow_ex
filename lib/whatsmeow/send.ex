@@ -105,7 +105,7 @@ defmodule Whatsmeow.Send do
   def send_text(server, peer, text, opts \\ []) when is_binary(text) do
     with {:ok, peer_jid} <- to_jid(peer),
          {:ok, %Device{} = device} <- Session.get_device(server),
-         {:ok, our_ad_jid} <- parse_device_jid(device.jid),
+         {:ok, our_ad_jid} <- own_identity(device, peer_jid),
          :ok <- guard_not_self(our_ad_jid, peer_jid) do
       inner_proto = %WAWebProtobufsE2E.Message{conversation: text}
       do_send_dm(server, device, our_ad_jid, peer_jid, inner_proto, "text", opts)
@@ -137,7 +137,7 @@ defmodule Whatsmeow.Send do
   def send_message(server, peer, %WAWebProtobufsE2E.Message{} = message, opts \\ []) do
     with {:ok, peer_jid} <- to_jid(peer),
          {:ok, %Device{} = device} <- Session.get_device(server),
-         {:ok, our_ad_jid} <- parse_device_jid(device.jid),
+         {:ok, our_ad_jid} <- own_identity(device, peer_jid),
          :ok <- guard_not_self(our_ad_jid, peer_jid) do
       msg_type = Keyword.get(opts, :message_type) || message_type(message)
       do_send_dm(server, device, our_ad_jid, peer_jid, message, msg_type, opts)
@@ -319,11 +319,17 @@ defmodule Whatsmeow.Send do
       # trip rather than a message.
       opts = Keyword.put(opts, :bundles, prefetch_bundles(server, device, devices, opts, timeout))
 
+      edit_attr = edit_attribute(inner_proto)
+
       {participant_nodes, any_pkmsg} =
-        parallel_fanout(devices, fn ad_jid ->
-          pt = if ad_jid.user == our_bare_user, do: dsm_plaintext, else: plaintext
-          {ad_jid, encrypt_plaintext_for_peer(server, device, ad_jid, pt, opts)}
-        end)
+        parallel_fanout(
+          devices,
+          fn ad_jid ->
+            pt = if ad_jid.user == our_bare_user, do: dsm_plaintext, else: plaintext
+            {ad_jid, encrypt_plaintext_for_peer(server, device, ad_jid, pt, opts)}
+          end,
+          enc_attrs(msg_type, inner_proto, edit_attr)
+        )
 
       case Enum.reverse(participant_nodes) do
         [] ->
@@ -334,7 +340,15 @@ defmodule Whatsmeow.Send do
             Keyword.get_lazy(opts, :message_id, fn -> generate_message_id(device.jid) end)
 
           msg_node =
-            build_dm_message_node(peer_jid, msg_id, participant_nodes, device, any_pkmsg, msg_type)
+            build_dm_message_node(
+              peer_jid,
+              msg_id,
+              participant_nodes,
+              device,
+              any_pkmsg,
+              msg_type,
+              edit_attr
+            )
 
           msg_node = attach_tctoken(msg_node, device.jid, peer_jid)
 
@@ -368,11 +382,61 @@ defmodule Whatsmeow.Send do
     end
   end
 
-  defp build_participant_node(%JID{} = ad_jid, envelope, enc_type)
-       when enc_type in ["msg", "pkmsg"] do
+  defp build_participant_node(%JID{} = ad_jid, envelope, enc_type, enc_attrs \\ %{})
+       when enc_type in ["msg", "pkmsg"] and is_map(enc_attrs) do
     Node.new("to", %{"jid" => ad_jid}, [
-      Node.new("enc", %{"v" => "2", "type" => enc_type}, envelope)
+      Node.new("enc", Map.merge(%{"v" => "2", "type" => enc_type}, enc_attrs), envelope)
     ])
+  end
+
+  @doc false
+  @spec edit_attribute(WAWebProtobufsE2E.Message.t()) :: String.t() | nil
+  def edit_attribute(%WAWebProtobufsE2E.Message{} = msg), do: do_edit_attribute(msg)
+
+  # **The `edit` attribute, and why removing a reaction could never work.**
+  #
+  # Mirrors Go's `getEditAttribute` (`whatsmeow-main/send.go:1030-1056`); the
+  # wire values are `types.EditAttribute` (`types/message.go:59-64`). A
+  # reaction whose text is empty is not an empty reaction — it is a *revoke* of
+  # the one already there, and the server only reads it as one when the stanza
+  # says `edit="7"`. `Whatsmeow.send_reaction/6` has documented `""` as the
+  # removal path the whole time while sending nothing the server could act on.
+  defp do_edit_attribute(%WAWebProtobufsE2E.Message{editedMessage: %{message: inner}})
+       when not is_nil(inner),
+       do: do_edit_attribute(inner)
+
+  defp do_edit_attribute(%WAWebProtobufsE2E.Message{reactionMessage: %{text: ""}}), do: "7"
+
+  defp do_edit_attribute(%WAWebProtobufsE2E.Message{pinInChatMessage: pin}) when not is_nil(pin),
+    do: "2"
+
+  defp do_edit_attribute(%WAWebProtobufsE2E.Message{protocolMessage: %{key: key, type: type}})
+       when not is_nil(key) do
+    case {type, key} do
+      {:REVOKE, %{fromMe: true}} -> "7"
+      {:REVOKE, _} -> "8"
+      {:MESSAGE_EDIT, _} -> "1"
+      _ -> nil
+    end
+  end
+
+  defp do_edit_attribute(%WAWebProtobufsE2E.Message{}), do: nil
+
+  # **`decrypt-fail="hide"` — the one enc attribute Go sets for reactions.**
+  #
+  # `whatsmeow-main/send.go:1195-1200`: an edit, a reaction, or a poll vote
+  # tells the recipient to say nothing at all if it cannot decrypt, rather than
+  # draw a "waiting for this message" placeholder in the middle of a thread for
+  # something that was only ever an emoji. This library had no path for enc
+  # attributes at all, so none of the three carried it.
+  @doc false
+  @spec enc_attrs(String.t(), WAWebProtobufsE2E.Message.t(), String.t() | nil) :: %{
+          optional(String.t()) => String.t()
+        }
+  def enc_attrs(msg_type, %WAWebProtobufsE2E.Message{} = msg, edit_attr) do
+    if msg_type == "reaction" or not is_nil(msg.pollUpdateMessage) or not is_nil(edit_attr),
+      do: %{"decrypt-fail" => "hide"},
+      else: %{}
   end
 
   defp build_dm_message_node(
@@ -381,20 +445,29 @@ defmodule Whatsmeow.Send do
          participant_nodes,
          %Device{} = device,
          include_identity?,
-         msg_type
+         msg_type,
+         edit_attr \\ nil
        )
        when is_binary(msg_type) do
-    # Mirror Go's `prepareMessageNode` (`whatsmeow-main/send.go:1185`)
-    # exactly — id / type / to only. `phash` is server-side: it's the
-    # value the server *returns* on the `<ack>`. Including `phash` as an
-    # outbound attr makes the stanza invalid against WhatsApp's SMAX
-    # schema and the server replies `<ack class="message" error="479">`
-    # (smax-invalid) without delivering. Took an hour to spot.
+    # Mirror Go's `prepareMessageNode` (`whatsmeow-main/send.go:1185`) — id /
+    # type / to, plus `edit` when the payload is a revoke, an edit or a pin
+    # (`send.go:1193`). **No `addressing_mode`:** Go sets that one only on the
+    # group path (`send.go:307-313`); a 1:1 LID send carries the LID in `to`
+    # and nothing else, and the identity it is sent under is chosen by
+    # `own_identity/2`.
+    #
+    # `phash` is server-side: it's the value the server *returns* on the
+    # `<ack>`. Including `phash` as an outbound attr makes the stanza invalid
+    # against WhatsApp's SMAX schema and the server replies
+    # `<ack class="message" error="479">` (smax-invalid) without delivering.
+    # Took an hour to spot.
     attrs = %{
       "id" => msg_id,
       "type" => msg_type,
       "to" => JID.to_non_ad(peer_jid)
     }
+
+    attrs = if edit_attr, do: Map.put(attrs, "edit", edit_attr), else: attrs
 
     participants_node = Node.new("participants", %{}, participant_nodes)
     children = [participants_node]
@@ -470,8 +543,9 @@ defmodule Whatsmeow.Send do
       true -> load_session(device.jid, Address.session_key(peer)) == :not_found
     end
   rescue
-    # A store that is not up is not a reason to skip the send; the per-device
-    # path will reach the same conclusion on its own.
+    # arch: a store that is not up is not a reason to skip the send; the
+    # per-device path will reach the same conclusion on its own, and the only
+    # thing this answers is whether to prefetch a bundle.
     _ -> false
   end
 
@@ -545,6 +619,33 @@ defmodule Whatsmeow.Send do
   end
 
   defp parse_device_jid(_), do: {:error, :no_device}
+
+  # **Which of our two identities a send is made under.**
+  #
+  # Mirrors Go's `SendMessage` (`whatsmeow-main/send.go:322-323`): a message
+  # addressed to a `@lid` peer is sent as our own LID, not our phone number.
+  # Everything the fanout keys on follows from this one value — the device list
+  # we ask `usync` for (`send.go:858` passes `ownID.ToNonAD()`), which devices
+  # get the `DeviceSentMessage` copy rather than the plaintext, and which ones
+  # `strip_self_and_hosted/2` removes.
+  #
+  # Addressing a LID envelope under our phone-number identity is what the
+  # server answers with `ack error=400`, and that ack is why this library's
+  # callers had all been resolving LID → phone before sending. That workaround
+  # delivers a text fine and quietly breaks anything carrying a `MessageKey`:
+  # the key then names an address the peer's own chat is not filed under, and a
+  # reaction or a poll vote against it is *accepted* and drawn as nothing.
+  #
+  # `device.lid` is the canonical `user.agent:device@lid` string the server
+  # handed us at pair time (`Whatsmeow.Pair`, `Whatsmeow.Login.lid_attr/1`), so
+  # it already carries our device id. A device paired before that field was
+  # stored has `nil` here and keeps the old behaviour.
+  defp own_identity(%Device{lid: lid}, %JID{server: server})
+       when is_binary(lid) and lid != "" and server == "lid" do
+    parse_device_jid(lid)
+  end
+
+  defp own_identity(%Device{jid: jid}, %JID{}), do: parse_device_jid(jid)
 
   # Reject sends where the peer resolves to our own user. WhatsApp Web
   # doesn't deliver self-1:1 messages through the normal peer protocol —
@@ -701,24 +802,27 @@ defmodule Whatsmeow.Send do
   `sender` — the original sender's JID. Pass `nil` (or an empty `%JID{}`)
              when the message was sent by us; pass a peer JID when revoking
              someone else's message as a group admin.
+  `own_users` — our own bare users (phone **and** LID), so that naming
+             ourselves explicitly is read as `fromMe: true`. See `own_users/1`.
 
   Mirrors Go's `Client.BuildMessageKey` (`send.go:488`).
   """
-  @spec build_message_key(JID.t() | String.t(), JID.t() | nil, String.t()) ::
+  @spec build_message_key(JID.t() | String.t(), JID.t() | nil, String.t(), [String.t()]) ::
           WACommon.MessageKey.t()
-  def build_message_key(chat, sender, msg_id) when is_binary(msg_id) do
+  # arch: documented by the `@doc` above — `own_users` only widened the arity.
+  def build_message_key(chat, sender, msg_id, own_users \\ []) when is_binary(msg_id) do
     {:ok, chat_jid} = to_jid(chat)
     chat_str = JID.to_string(chat_jid)
 
     base = %WACommon.MessageKey{
-      fromMe: from_me?(sender),
+      fromMe: from_me?(sender, own_users),
       ID: msg_id,
       remoteJID: chat_str
     }
 
     case sender do
       %JID{user: u, server: _} = peer when u != "" ->
-        if from_me?(sender) do
+        if from_me?(sender, own_users) do
           base
         else
           participant =
@@ -740,10 +844,33 @@ defmodule Whatsmeow.Send do
     end
   end
 
-  defp from_me?(nil), do: true
-  defp from_me?(%JID{user: ""}), do: true
-  defp from_me?(%JID{server: ""}), do: true
-  defp from_me?(%JID{}), do: false
+  # Go compares the sender against **both** of our own users — the phone number
+  # and the LID (`whatsmeow-main/send.go:494`) — so naming yourself explicitly
+  # still yields `fromMe: true`. Without the comparison any non-empty sender was
+  # "somebody else", and a key built that way points at a message that does not
+  # exist; the server takes the stanza and the recipient draws nothing.
+  # `own_users` is empty when the caller has no device in hand, which keeps the
+  # old behaviour for everything that never names itself.
+  defp from_me?(nil, _own), do: true
+  defp from_me?(%JID{user: ""}, _own), do: true
+  defp from_me?(%JID{server: ""}, _own), do: true
+  defp from_me?(%JID{user: user}, own_users), do: user in own_users
+
+  @doc "Our own bare users — phone number and LID — for `build_message_key/4`."
+  @spec own_users(Device.t()) :: [String.t()]
+  def own_users(%Device{} = device) do
+    [device.jid, device.lid]
+    |> Enum.flat_map(fn
+      jid when is_binary(jid) and jid != "" ->
+        case JID.parse(jid) do
+          {:ok, %JID{user: user}} when user != "" -> [user]
+          _ -> []
+        end
+
+      _ ->
+        []
+    end)
+  end
 
   @doc """
   Build a `PEER_DATA_OPERATION_REQUEST_MESSAGE` asking the user's
@@ -890,13 +1017,14 @@ defmodule Whatsmeow.Send do
 
   Mirrors Go's `Client.BuildReaction` (`send.go:528`).
   """
-  @spec build_reaction(JID.t() | String.t(), JID.t() | nil, String.t(), String.t()) ::
+  @spec build_reaction(JID.t() | String.t(), JID.t() | nil, String.t(), String.t(), [String.t()]) ::
           WAWebProtobufsE2E.Message.t()
-  def build_reaction(chat, sender, msg_id, reaction)
+  # arch: documented by the `@doc` above — `own_users` only widened the arity.
+  def build_reaction(chat, sender, msg_id, reaction, own_users \\ [])
       when is_binary(msg_id) and is_binary(reaction) do
     %WAWebProtobufsE2E.Message{
       reactionMessage: %WAWebProtobufsE2E.ReactionMessage{
-        key: build_message_key(chat, sender, msg_id),
+        key: build_message_key(chat, sender, msg_id, own_users),
         text: reaction,
         senderTimestampMS: System.system_time(:millisecond)
       }
@@ -1043,7 +1171,7 @@ defmodule Whatsmeow.Send do
   defp send_media(server, peer, bytes, kind, opts) do
     with {:ok, peer_jid} <- to_jid(peer),
          {:ok, %Device{} = device} <- Session.get_device(server),
-         {:ok, our_ad_jid} <- parse_device_jid(device.jid),
+         {:ok, our_ad_jid} <- own_identity(device, peer_jid),
          :ok <- guard_not_self(our_ad_jid, peer_jid),
          {:ok, upload} <- upload_media_bytes(bytes, kind, opts) do
       inner_proto =
@@ -1449,13 +1577,15 @@ defmodule Whatsmeow.Send do
   # the lock it encrypted under (see `encrypt_plaintext_for_peer/5`). Batching the
   # writes until after the send is what let a concurrent decrypt get clobbered.
 
-  @doc false
+  @doc "Encrypt one envelope per recipient device in parallel, returning the `<to>` nodes and whether any used `pkmsg`."
   @spec parallel_fanout(
           [JID.t()],
           (JID.t() ->
-             {JID.t(), {:ok, binary(), String.t(), term()} | {:error, term()}})
+             {JID.t(), {:ok, binary(), String.t(), term()} | {:error, term()}}),
+          %{optional(String.t()) => String.t()}
         ) :: {[Node.t()], boolean()}
-  def parallel_fanout(devices, encrypt_fun) when is_list(devices) and is_function(encrypt_fun, 1) do
+  def parallel_fanout(devices, encrypt_fun, enc_attrs \\ %{})
+      when is_list(devices) and is_function(encrypt_fun, 1) and is_map(enc_attrs) do
     devices
     |> Task.async_stream(encrypt_fun,
       max_concurrency: Whatsmeow.Config.send_concurrency(),
@@ -1463,25 +1593,26 @@ defmodule Whatsmeow.Send do
       timeout: Whatsmeow.Config.fanout_task_timeout_ms(),
       on_timeout: :kill_task
     )
-    |> Enum.reduce({[], false}, &collect_fanout_result/2)
+    |> Enum.reduce({[], false}, &collect_fanout_result(&1, &2, enc_attrs))
   end
 
   defp collect_fanout_result(
          {:ok, {%JID{} = ad_jid, {:ok, envelope, enc_type, _new_sess}}},
-         {nodes, pkmsg?}
+         {nodes, pkmsg?},
+         enc_attrs
        )
        when enc_type in ["msg", "pkmsg"] do
-    participant = build_participant_node(ad_jid, envelope, enc_type)
+    participant = build_participant_node(ad_jid, envelope, enc_type, enc_attrs)
     {[participant | nodes], pkmsg? or enc_type == "pkmsg"}
   end
 
-  defp collect_fanout_result({:ok, {%JID{} = ad_jid, {:error, reason}}}, acc) do
+  defp collect_fanout_result({:ok, {%JID{} = ad_jid, {:error, reason}}}, acc, _enc_attrs) do
     Logger.warning("[whatsmeow] dm fanout: skipped #{JID.to_string(ad_jid)}: #{inspect(reason)}")
 
     acc
   end
 
-  defp collect_fanout_result({:exit, reason}, acc) do
+  defp collect_fanout_result({:exit, reason}, acc, _enc_attrs) do
     Logger.warning("[whatsmeow] dm fanout: task crashed: #{inspect(reason)}")
     acc
   end
