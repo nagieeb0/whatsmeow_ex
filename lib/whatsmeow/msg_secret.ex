@@ -172,9 +172,76 @@ defmodule Whatsmeow.MsgSecret do
   Mirrors Go's `HashPollOptions` (`msgsecret.go:293`).
   """
   @spec hash_poll_options([String.t()]) :: [<<_::256>>]
+  # arch: documented by the `@doc` above.
   def hash_poll_options(option_names) when is_list(option_names) do
     Enum.map(option_names, fn name when is_binary(name) ->
       :crypto.hash(:sha256, name)
     end)
+  end
+
+  @doc """
+  Decrypt an inbound poll vote into the SHA-256 hashes of the options chosen.
+
+  Match them against `hash_poll_options/1` of the names you offered.
+
+  * `update` — the `pollUpdateMessage` from the inbound message.
+  * `voter` — the voter's JID as a bare `user@server` string, **exactly as it
+    arrived**. See the note below.
+  * `poll_senders` — one or more candidates for the poll creator's JID, tried in
+    order. For a poll this account sent, that is our own number and our own LID.
+  * `secret` — the 32 bytes `build_poll_creation/3` put in the poll's
+    `messageContextInfo.messageSecret`. Nothing in this library stores it; keep
+    it beside whatever you keep the poll's options in.
+
+  ## Why `poll_senders` is a list
+
+  The key is derived from the two participants' JID **strings**, so a number
+  and a LID for the same person derive different keys and a mismatch is an
+  authentication failure, not a wrong answer. Upstream Go carries the same
+  fallback as an explicit hack (`whatsmeow-main/msgsecret.go:113-121`): try the
+  sender named by the vote's key, then the one the secret was stored against,
+  *"hopefully unnecessary when WhatsApp fully finishes their migration to
+  LIDs"*. `amarula` states the rule outright — PN and LID are not normalised,
+  the derivation must match what the voter actually used — and this codebase
+  has already paid three guesses to learn it on reactions.
+  """
+  @spec decrypt_poll_vote(
+          WAWebProtobufsE2E.PollUpdateMessage.t(),
+          binary(),
+          [binary()] | binary(),
+          binary()
+        ) :: {:ok, [binary()]} | {:error, atom()}
+  # arch: documented by the `@doc` above.
+  def decrypt_poll_vote(update, voter, poll_senders, secret)
+
+  def decrypt_poll_vote(update, voter, poll_sender, secret) when is_binary(poll_sender),
+    do: decrypt_poll_vote(update, voter, [poll_sender], secret)
+
+  def decrypt_poll_vote(
+        %WAWebProtobufsE2E.PollUpdateMessage{
+          pollCreationMessageKey: %{ID: poll_id},
+          vote: %WAWebProtobufsE2E.PollEncValue{encPayload: ct, encIV: iv}
+        },
+        voter,
+        poll_senders,
+        secret
+      )
+      when is_binary(poll_id) and is_binary(ct) and is_binary(iv) and is_binary(voter) and
+             is_list(poll_senders) and is_binary(secret) do
+    poll_senders
+    |> Enum.reduce_while({:error, :aead_auth_failed}, fn sender, _last ->
+      case decrypt(:poll_vote, voter, poll_id, sender, secret, ct, iv) do
+        {:ok, plaintext} -> {:halt, selected_options(plaintext)}
+        error -> {:cont, error}
+      end
+    end)
+  end
+
+  def decrypt_poll_vote(_update, _voter, _poll_senders, _secret), do: {:error, :not_a_poll_vote}
+
+  defp selected_options(plaintext) do
+    {:ok, WAWebProtobufsE2E.PollVoteMessage.decode(plaintext).selectedOptions}
+  rescue
+    _ -> {:error, :undecodable_vote}
   end
 end
