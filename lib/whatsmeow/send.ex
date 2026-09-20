@@ -347,7 +347,7 @@ defmodule Whatsmeow.Send do
               device,
               any_pkmsg,
               msg_type,
-              edit_attr
+              inner_proto
             )
 
           msg_node = attach_tctoken(msg_node, device.jid, peer_jid)
@@ -434,9 +434,40 @@ defmodule Whatsmeow.Send do
           optional(String.t()) => String.t()
         }
   def enc_attrs(msg_type, %WAWebProtobufsE2E.Message{} = msg, edit_attr) do
-    if msg_type == "reaction" or not is_nil(msg.pollUpdateMessage) or not is_nil(edit_attr),
-      do: %{"decrypt-fail" => "hide"},
-      else: %{}
+    hide? = msg_type == "reaction" or not is_nil(msg.pollUpdateMessage) or not is_nil(edit_attr)
+
+    %{}
+    |> then(&if hide?, do: Map.put(&1, "decrypt-fail", "hide"), else: &1)
+    |> then(fn attrs ->
+      case enc_media_type(msg) do
+        nil -> attrs
+        type -> Map.put(attrs, "mediatype", type)
+      end
+    end)
+  end
+
+  # **The second thing a list needs, and the `<biz>` node is only the first.**
+  #
+  # Go's `getMediaTypeFromMessage` (`whatsmeow-main/send.go:928-978`) names a
+  # `listMessage` and the three tap-reply shapes, and `send.go:1182` puts that
+  # name on every `<enc>` as `mediatype`. So a list is announced three times —
+  # `type="text"` on the message, `mediatype="list"` on the envelopes, and
+  # `<biz><list v="2" type="single_select"/></biz>` beside them — and the probe
+  # that found "a linked device cannot send a list" supplied none of them.
+  #
+  # **Image, video, audio and document are deliberately left out**, although Go
+  # names those too. `message_type/1` already documents why this library does
+  # not follow Go into `type="media"` — it was a silent delivery killer here —
+  # and media currently works. Adding an attribute to a path that works, on the
+  # strength of a symmetry argument, is how that one was broken the first time.
+  defp enc_media_type(%WAWebProtobufsE2E.Message{} = msg) do
+    case unwrap_for_type(msg) do
+      %{listMessage: m} when not is_nil(m) -> "list"
+      %{listResponseMessage: m} when not is_nil(m) -> "list_response"
+      %{buttonsResponseMessage: m} when not is_nil(m) -> "buttons_response"
+      %{interactiveResponseMessage: m} when not is_nil(m) -> "native_flow_response"
+      _ -> nil
+    end
   end
 
   defp build_dm_message_node(
@@ -446,9 +477,10 @@ defmodule Whatsmeow.Send do
          %Device{} = device,
          include_identity?,
          msg_type,
-         edit_attr \\ nil
+         message
        )
        when is_binary(msg_type) do
+    edit_attr = message && edit_attribute(message)
     # Mirror Go's `prepareMessageNode` (`whatsmeow-main/send.go:1185`) — id /
     # type / to, plus `edit` when the payload is a revoke, an edit or a pin
     # (`send.go:1193`). **No `addressing_mode`:** Go sets that one only on the
@@ -481,7 +513,74 @@ defmodule Whatsmeow.Send do
         do: children ++ [device_identity_node(device)],
         else: children
 
-    Node.new("message", attrs, children)
+    Node.new("message", attrs, children ++ declaration_nodes(msg_type, message))
+  end
+
+  # **What the payload *is*, said out loud on the stanza.**
+  #
+  # Go's `getMessageContent` (`whatsmeow-main/send.go:1110-1152`) appends two
+  # more children that this function never sent: a `<meta polltype=…>` for a
+  # poll, and a `<biz>` naming the interactive kind for buttons and lists. They
+  # are how the recipient's client learns that the encrypted payload is
+  # something other than a message to print.
+  #
+  # Without them all three surfaces are **accepted and drawn as nothing** — the
+  # server returns a message id, no `ack` error ever arrives, and no button,
+  # list or poll appears on any screen. Measured twice from this library on 20
+  # September 2026 and written up as "a linked device cannot send buttons",
+  # which was reading a missing node as a platform rule.
+  defp declaration_nodes(msg_type, message) do
+    Enum.reject([poll_node(msg_type, message), biz_node(message)], &is_nil/1)
+  end
+
+  defp poll_node("poll", %WAWebProtobufsE2E.Message{} = message),
+    do: Node.new("meta", %{"polltype" => poll_type(message)}, [])
+
+  defp poll_node(_msg_type, _message), do: nil
+
+  defp biz_node(%WAWebProtobufsE2E.Message{} = message) do
+    case button_type(message) do
+      nil -> nil
+      kind -> Node.new("biz", %{}, [Node.new(kind, button_attrs(message), [])])
+    end
+  end
+
+  defp biz_node(_message), do: nil
+
+  @doc false
+  @spec poll_type(WAWebProtobufsE2E.Message.t()) :: String.t()
+  def poll_type(%WAWebProtobufsE2E.Message{pollUpdateMessage: vote}) when not is_nil(vote),
+    do: "vote"
+
+  def poll_type(%WAWebProtobufsE2E.Message{}), do: "creation"
+
+  @doc false
+  @spec button_type(WAWebProtobufsE2E.Message.t()) :: String.t() | nil
+  def button_type(%WAWebProtobufsE2E.Message{} = message) do
+    # Mirrors Go's `getButtonTypeFromMessage` (`send.go:982-1002`). `templateMessage`
+    # is deliberately absent there too — it carries its buttons inside the payload.
+    case unwrap_for_type(message) do
+      %{buttonsMessage: m} when not is_nil(m) -> "buttons"
+      %{buttonsResponseMessage: m} when not is_nil(m) -> "buttons_response"
+      %{listMessage: m} when not is_nil(m) -> "list"
+      %{listResponseMessage: m} when not is_nil(m) -> "list_response"
+      %{interactiveResponseMessage: m} when not is_nil(m) -> "interactive_response"
+      _ -> nil
+    end
+  end
+
+  @doc false
+  @spec button_attrs(WAWebProtobufsE2E.Message.t()) :: %{optional(String.t()) => String.t()}
+  def button_attrs(%WAWebProtobufsE2E.Message{} = message) do
+    # Only a list carries any (`send.go:1004-1021`): `type` is the `ListType`
+    # enum name lowercased, which is what the client switches its renderer on.
+    case unwrap_for_type(message) do
+      %{listMessage: %{listType: type}} when not is_nil(type) ->
+        %{"v" => "2", "type" => type |> to_string() |> String.downcase()}
+
+      _ ->
+        %{}
+    end
   end
 
   # Attach the recipient's trusted-contact token, when we hold an unexpired one.
@@ -1680,6 +1779,21 @@ defmodule Whatsmeow.Send do
     _ -> from
   end
 
+  # A retry receipt hands us the cached **plaintext**, not the struct it came
+  # from, and the `<biz>` / `<meta polltype>` children are derived from the
+  # struct. Decoding it back costs a microsecond and keeps a re-sent buttons or
+  # poll message the same shape as the first attempt; anything that will not
+  # decode is re-sent exactly as before.
+  defp decoded(plaintext) when is_binary(plaintext) do
+    WAWebProtobufsE2E.Message.decode(plaintext)
+  rescue
+    # arch: this only decides whether two optional children are attached; a
+    # malformed cache entry must not fail the retry it is there to answer.
+    _ -> nil
+  end
+
+  defp decoded(_plaintext), do: nil
+
   defp resend_to_device(server, device, from, peer_jid, plaintext, msg_type, msg_id) do
     Logger.info(
       "[whatsmeow] answering a retry receipt id=#{msg_id} device=#{JID.to_string(from)}",
@@ -1695,7 +1809,8 @@ defmodule Whatsmeow.Send do
             [build_participant_node(from, envelope, enc_type)],
             device,
             enc_type == "pkmsg",
-            msg_type
+            msg_type,
+            decoded(plaintext)
           )
 
         Session.send_node(server, attach_tctoken(node, device.jid, peer_jid))

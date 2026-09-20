@@ -195,6 +195,35 @@ defmodule Whatsmeow.Send.BuildersTest do
     test "plain text does not" do
       assert Send.enc_attrs("text", %WAWebProtobufsE2E.Message{conversation: "hi"}, nil) == %{}
     end
+
+    # Go names a list on the `<enc>` as well as in the `<biz>` node
+    # (`send.go:966`, `send.go:1182`). The probe that concluded "a linked device
+    # cannot send a list" supplied neither.
+    test "a list is named on every envelope too" do
+      list = %WAWebProtobufsE2E.Message{
+        listMessage: %WAWebProtobufsE2E.ListMessage{title: "t", listType: :SINGLE_SELECT}
+      }
+
+      assert Send.enc_attrs("text", list, nil) == %{"mediatype" => "list"}
+    end
+
+    test "and so is a tap coming back" do
+      tap = %WAWebProtobufsE2E.Message{
+        buttonsResponseMessage: %WAWebProtobufsE2E.ButtonsResponseMessage{selectedButtonID: "x"}
+      }
+
+      assert Send.enc_attrs("text", tap, nil) == %{"mediatype" => "buttons_response"}
+    end
+
+    # `message_type/1` documents why this library does not follow Go into
+    # `type="media"`; the same caution applies to the enc attribute.
+    test "an image is not, because that path works and was not measured" do
+      image = %WAWebProtobufsE2E.Message{
+        imageMessage: %WAWebProtobufsE2E.ImageMessage{mimetype: "image/jpeg"}
+      }
+
+      assert Send.enc_attrs("text", image, nil) == %{}
+    end
   end
 
   describe "build_message_key/4 — naming ourselves (Go send.go:494)" do
@@ -236,6 +265,70 @@ defmodule Whatsmeow.Send.BuildersTest do
     test "a device paired before the LID was stored yields just the phone number" do
       device = %Whatsmeow.Store.Schemas.Device{jid: "12345.0:3@s.whatsapp.net", lid: nil}
       assert Send.own_users(device) == ["12345"]
+    end
+  end
+
+  describe "the stanza children that say what a payload is (Go send.go:1110-1152)" do
+    # These three were the whole reason buttons, lists and polls were accepted
+    # and drawn as nothing: the encrypted payload said "I am a list" and the
+    # stanza around it said nothing at all.
+    defp buttons_message do
+      %WAWebProtobufsE2E.Message{
+        buttonsMessage: %WAWebProtobufsE2E.ButtonsMessage{contentText: "pick one"}
+      }
+    end
+
+    defp list_message(type) do
+      %WAWebProtobufsE2E.Message{
+        listMessage: %WAWebProtobufsE2E.ListMessage{title: "options", listType: type}
+      }
+    end
+
+    test "buttons are named on the stanza" do
+      assert Send.button_type(buttons_message()) == "buttons"
+      assert Send.button_attrs(buttons_message()) == %{}
+    end
+
+    test "a list is named and carries its renderer type" do
+      assert Send.button_type(list_message(:SINGLE_SELECT)) == "list"
+
+      assert Send.button_attrs(list_message(:SINGLE_SELECT)) == %{
+               "v" => "2",
+               "type" => "single_select"
+             }
+    end
+
+    test "a reply to either is named too, so the sender's client can match it" do
+      response = %WAWebProtobufsE2E.Message{
+        listResponseMessage: %WAWebProtobufsE2E.ListResponseMessage{title: "chosen"}
+      }
+
+      assert Send.button_type(response) == "list_response"
+    end
+
+    test "wrappers are unwrapped first — a view-once list is still a list" do
+      wrapped = %WAWebProtobufsE2E.Message{
+        viewOnceMessage: %WAWebProtobufsE2E.FutureProofMessage{
+          message: list_message(:SINGLE_SELECT)
+        }
+      }
+
+      assert Send.button_type(wrapped) == "list"
+    end
+
+    test "plain text is named nothing, and gets no biz node" do
+      assert Send.button_type(%WAWebProtobufsE2E.Message{conversation: "hi"}) == nil
+    end
+
+    test "a poll declares whether it is the question or an answer" do
+      creation = Send.build_poll_creation("q", ~w(a b), 1)
+      assert Send.poll_type(creation) == "creation"
+
+      vote = %WAWebProtobufsE2E.Message{
+        pollUpdateMessage: %WAWebProtobufsE2E.PollUpdateMessage{}
+      }
+
+      assert Send.poll_type(vote) == "vote"
     end
   end
 end
