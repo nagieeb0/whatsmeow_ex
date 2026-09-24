@@ -343,6 +343,29 @@ defmodule Whatsmeow.SessionTest do
   # `:authenticated` for ever, reporting healthy to every screen while answering
   # nobody. The watchdog's repair was then dropped as a no-op, because the
   # status looked fine.
+  # A reconnect inside the same process kept the last connection's `:answered`,
+  # so `:go_active` skipped `<active/>` and the device came up passive: it could
+  # send, and nothing was routed to it.
+  describe "every login goes active again" do
+    test "a success resets what the previous connection's active IQ said" do
+      device_id = "active-#{System.unique_integer([:positive])}"
+      :ok = Whatsmeow.Notifications.subscribe(device_id)
+      on_exit(fn -> Whatsmeow.Notifications.unsubscribe(device_id) end)
+
+      state =
+        device_id
+        |> base_state(status: :connected)
+        |> Map.put(:active_iq, :answered)
+        |> Session.__dispatch_node__(Node.new("success", %{"t" => "1715000000"}))
+
+      assert state.status == :authenticated
+      assert state.active_iq == nil, "a stale :answered makes :go_active a no-op"
+
+      {:noreply, state} = Session.handle_info(:go_active, state)
+      refute state.active_iq == nil, "the new connection must at least try to go active"
+    end
+  end
+
   describe "keepalive" do
     setup do
       device_id = "sess-test-#{System.unique_integer([:positive])}"

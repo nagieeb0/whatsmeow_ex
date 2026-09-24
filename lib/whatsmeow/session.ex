@@ -2498,6 +2498,16 @@ defmodule Whatsmeow.Session do
         state
         |> Map.put(:status, :authenticated)
         |> Map.put(:logged_in_at, DateTime.utc_now())
+        # **Every login announces itself active, not only the first.**
+        #
+        # `:go_active` sends `<active/>` only while `active_iq` is `nil`/`:unsent`,
+        # and nothing reset it — so a reconnect inside the same process kept the
+        # previous connection's `:answered`, skipped the stanza and came up
+        # passive: sending worked, and the server routed it nothing. Measured on
+        # 24 September: the opening after a watchdog reconnect ran success →
+        # encrypt → count → usync → pings, with no passive IQ, and a staff member
+        # and a patient both wrote to it and were never delivered.
+        |> Map.put(:active_iq, nil)
         |> Map.put(:keepalive_failures, 0)
         # Authenticated, not merely connected — the only evidence that whatever
         # the server was refusing has stopped. `reconnect_attempts` joins it
