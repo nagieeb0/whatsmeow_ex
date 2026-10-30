@@ -205,15 +205,11 @@ defmodule Whatsmeow.Receipt do
     Node.new("receipt", drop_nils(attrs), nil)
   end
 
-  defp maybe_ack_type(%Node{tag: "message"} = msg) do
-    case Node.attr(msg, "type") do
-      "text" -> nil
-      "media" -> nil
-      _ -> nil
-    end
-  end
-
-  defp maybe_ack_type(_), do: nil
+  # Go's sendAck echoes `type` for everything but a <message>. Without it the server does not match the ack
+  # to a read receipt or a typed notification: it resends them on every connect, ends the stream with
+  # `<stream:error><ack/>` about every 50 minutes, and in the end removes the device (401 device_removed).
+  defp maybe_ack_type(%Node{tag: "message"}), do: nil
+  defp maybe_ack_type(node), do: Node.attr(node, "type")
 
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, _key, ""), do: map

@@ -106,4 +106,28 @@ defmodule Whatsmeow.ReceiptTest do
       assert ev.message_ids == ["MSG1"]
     end
   end
+
+  describe "build_ack/2" do
+    test "echoes type for a receipt or notification, never for a message (Go's sendAck)" do
+      read =
+        Node.new("receipt", %{"id" => "R1", "from" => "133066844578011@lid", "type" => "read"}, nil)
+
+      assert %{"class" => "receipt", "id" => "R1", "to" => "133066844578011@lid", "type" => "read"} =
+               Receipt.build_ack(read).attrs
+
+      delivery = Node.new("receipt", %{"id" => "R2", "from" => "133066844578011@lid"}, nil)
+      refute Map.has_key?(Receipt.build_ack(delivery).attrs, "type")
+
+      note =
+        Node.new(
+          "notification",
+          %{"id" => "N1", "from" => "s.whatsapp.net", "type" => "encrypt"},
+          nil
+        )
+
+      assert Receipt.build_ack(note).attrs["type"] == "encrypt"
+
+      refute Map.has_key?(Receipt.build_ack(inbound_msg(%{"type" => "text"})).attrs, "type")
+    end
+  end
 end
