@@ -20,8 +20,9 @@ defmodule Whatsmeow.AppState.Hash do
     HMAC-SHA512(value_mac_key, op_byte || key_id || ciphertext ||
                                u64_be(len(key_id) + 1))[0..32]
 
-  where `op_byte = op + 1` (SET=2, REMOVE=3) following the upstream wire
-  encoding.
+  where `op_byte = op + 1` over the protobuf enum `SyncdOperation`
+  (`SET = 0`, `REMOVE = 1`), so SET=1, REMOVE=2 — Go's
+  `byte(operation) + 1` in `generateContentMAC`.
   """
 
   alias Whatsmeow.AppState.LTHash
@@ -52,9 +53,12 @@ defmodule Whatsmeow.AppState.Hash do
   SET and REMOVE) and must return the value MAC of the previous SET on
   that index (or `nil` if none / unknown). It receives the current
   mutation index `i` so the caller can look only at earlier entries.
+
+  Returns the new state and the warnings Go collects rather than fails on:
+  a REMOVE whose previous SET is unknown.
   """
   @spec update(t(), [map()], (binary(), non_neg_integer() -> binary() | nil)) ::
-          {:ok, t()} | {:error, term()}
+          {:ok, t(), [{:missing_previous_set_value, binary()}]}
   def update(%__MODULE__{hash: hash} = state, mutations, prev_set_value_mac)
       when is_list(mutations) and is_function(prev_set_value_mac, 2) do
     {added, removed, warnings} =
@@ -120,7 +124,10 @@ defmodule Whatsmeow.AppState.Hash do
   def content_mac(op, data, key_id, key)
       when op in [:set, :remove] and is_binary(data) and is_binary(key_id) and
              is_binary(key) and byte_size(key) == 32 do
-    op_byte = if op == :set, do: 2, else: 3
+    # `SyncdOperation` is SET = 0, REMOVE = 1 and Go MACs `byte(op) + 1`.
+    # This used to be 2/3, which no other device would ever verify; the
+    # Go vectors in `go_vectors_test.exs` pin it now.
+    op_byte = if op == :set, do: 1, else: 2
     key_len = byte_size(key_id) + 1
 
     :crypto.mac(:hmac, :sha512, key, [
