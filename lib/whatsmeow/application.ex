@@ -44,6 +44,7 @@ defmodule Whatsmeow.Application do
       {Task.Supervisor, name: Whatsmeow.Media.TaskSup},
       {Task.Supervisor, name: Whatsmeow.Sessions.TaskSup},
       Whatsmeow.Retry.RecentCache,
+      Whatsmeow.AppState.Coordinator,
       Whatsmeow.Media.HKDFCache,
       Whatsmeow.User.DeviceCache,
       Whatsmeow.WAVersion.Refresher
@@ -60,6 +61,7 @@ defmodule Whatsmeow.Application do
       {Task.Supervisor, name: Whatsmeow.Media.TaskSup},
       {Task.Supervisor, name: Whatsmeow.Sessions.TaskSup},
       Whatsmeow.Retry.RecentCache,
+      Whatsmeow.AppState.Coordinator,
       Whatsmeow.Media.HKDFCache,
       Whatsmeow.User.DeviceCache,
       Whatsmeow.WAVersion.Refresher

@@ -1,0 +1,15 @@
+package appstate
+
+import "go.mau.fi/whatsmeow/proto/waServerSync"
+
+// Test shims over unexported functions. The logic under test is the verbatim copy.
+func ExpandKeys(keyData []byte) ExpandedAppStateKeys { return expandAppStateKeys(keyData) }
+func ContentMAC(op waServerSync.SyncdMutation_SyncdOperation, data, keyID, key []byte) []byte {
+	return generateContentMAC(op, data, keyID, key)
+}
+func (hs *HashState) SnapshotMAC(name WAPatchName, key []byte) []byte {
+	return hs.generateSnapshotMAC(name, key)
+}
+func PatchMAC(p *waServerSync.SyncdPatch, name WAPatchName, key []byte, version uint64) []byte {
+	return generatePatchMAC(p, name, key, version)
+}

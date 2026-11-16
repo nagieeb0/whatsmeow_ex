@@ -369,6 +369,80 @@ defmodule Whatsmeow do
   @doc "Resolve the device list for `jids`. Cached — see `Whatsmeow.User.DeviceCache`."
   defdelegate get_user_devices(session, jids, opts \\ []), to: Whatsmeow.User
 
+  # --- Chat state: archive / mark read (app-state patches) ---------------------
+
+  @doc """
+  Archive a chat on the account, as the phone would. `{:ok, version}` — the new
+  version of the `regular_low` collection — or `{:error, reason}`. Never raises.
+
+  `last_message` says what the chat's latest message was, so the phone can tell
+  "archived up to here": `nil`, a Unix-seconds timestamp or `DateTime`,
+  `{timestamp, key}`, or a keyword list/map
+  (`last_message_timestamp:`, `last_message_key:` / `messages:`). A message key is
+  `%{id: "3EB0…", remote_jid: "1555…@s.whatsapp.net", from_me: false}`. See
+  `t:Whatsmeow.AppState.last_message/0`.
+
+  Sends `["archive", jid]` plus `["pin_v1", jid]` (unpin), exactly as Go
+  whatsmeow's `BuildArchive`.
+
+  Errors worth handling: `:no_app_state_keys` / `{:key_not_found, id}` (the phone
+  has not shared its keys with this device yet — it is asked, retry later),
+  `{:rejected, %{code: _}}` (the server refused the patch), `{:resync_failed, _}`
+  (the patch **was accepted**; do not blindly resend), `:invalid_jid`,
+  `:offline_session`. Full list: `Whatsmeow.AppState.Sync`.
+
+  > #### Trial on a spare number first
+  >
+  > App-state is end-to-end encrypted, so the server cannot check a patch's MACs; a
+  > malformed one is forwarded to the phone and rejected there, which breaks
+  > app-state sync for that collection (what else the phone does is unobserved). The
+  > encoding is verified against Go whatsmeow's output, but has **not** been
+  > exercised against a live account.
+  > Run it on a throwaway number before a personal one. See `Whatsmeow.AppState`.
+  """
+  @spec archive_chat(
+          session | String.t(),
+          Whatsmeow.Types.JID.t() | String.t(),
+          Whatsmeow.AppState.last_message()
+        ) ::
+          Whatsmeow.AppState.result()
+  def archive_chat(session, jid, last_message \\ nil),
+    do: Whatsmeow.AppState.archive_chat(session, jid, last_message)
+
+  @doc "Undo `archive_chat/3`. Same contract and the same warning."
+  @spec unarchive_chat(
+          session | String.t(),
+          Whatsmeow.Types.JID.t() | String.t(),
+          Whatsmeow.AppState.last_message()
+        ) ::
+          Whatsmeow.AppState.result()
+  def unarchive_chat(session, jid, last_message \\ nil),
+    do: Whatsmeow.AppState.unarchive_chat(session, jid, last_message)
+
+  @doc """
+  Mark a chat read on the account (clears the unread badge on the phone). Sends
+  `["markChatAsRead", jid]` as Go's `BuildMarkChatAsRead`. Same arguments, return
+  value and warning as `archive_chat/3`.
+  """
+  @spec mark_chat_read(
+          session | String.t(),
+          Whatsmeow.Types.JID.t() | String.t(),
+          Whatsmeow.AppState.last_message()
+        ) ::
+          Whatsmeow.AppState.result()
+  def mark_chat_read(session, jid, last_message \\ nil),
+    do: Whatsmeow.AppState.mark_chat_read(session, jid, last_message)
+
+  @doc "Mark a chat unread. Same contract and warning as `mark_chat_read/3`."
+  @spec mark_chat_unread(
+          session | String.t(),
+          Whatsmeow.Types.JID.t() | String.t(),
+          Whatsmeow.AppState.last_message()
+        ) ::
+          Whatsmeow.AppState.result()
+  def mark_chat_unread(session, jid, last_message \\ nil),
+    do: Whatsmeow.AppState.mark_chat_unread(session, jid, last_message)
+
   @doc false
   def topic_for(device_id), do: "whatsmeow:device:" <> device_id
 end

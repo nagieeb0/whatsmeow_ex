@@ -1,0 +1,584 @@
+{
+  "content_mac": [
+    {
+      "op": "SET",
+      "data": "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeaf",
+      "key_id": "00000000002a",
+      "key": "0cbf758b5c99b44023f568a037ff169c82427b406107a99089bdab37fb1f593e",
+      "mac": "ff39abd7bc9aadae7475c71f4e176ff632a43510d5d978f488c71752f7a5335a"
+    },
+    {
+      "op": "REMOVE",
+      "data": "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeaf",
+      "key_id": "00000000002a",
+      "key": "0cbf758b5c99b44023f568a037ff169c82427b406107a99089bdab37fb1f593e",
+      "mac": "593ce72993b209816b715be8b51e1155a1632e52bf4d9fc970368fa4d66f7430"
+    }
+  ],
+  "expanded": {
+    "index": "ddf84ab8e3f7d035358faab860cf4d68aaa82444fdcf3ff98e4d38ff3ca0a2b7",
+    "patch_mac": "118fd7a9460b9922a5b1c758a4ee599bb816be2857d428c45632a7b8b76434e5",
+    "snapshot_mac": "381f92773626fc7493b7d6df291ef22cf5419046f1877dc1bc8c5ce1d21bd244",
+    "value_encryption": "2c028361b328add92736e295ef965bcca0988f0f8093fe3529d4382dc291f1e9",
+    "value_mac": "0cbf758b5c99b44023f568a037ff169c82427b406107a99089bdab37fb1f593e"
+  },
+  "key_data": "101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f",
+  "key_id": "00000000002a",
+  "lthash": [
+    {
+      "add": [
+        "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+        "02030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f2021",
+        "030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122"
+      ],
+      "sub": [],
+      "base": "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "result": "8a566a836f687bb9309abece322b70efe8dbbb2fe870b40400137625854148d0104c473cc0438663a6dc642a65213ad9fc6564aaf1981469a0600494286d4dc945d54f8d6ef2c1a5cb7b294480245c437ac8430e262a7acea101ebca5683183b1fae5cf77c020f7a3a4374a1682810c616e40aaf6996d4cbcc520f07da098afc"
+    },
+    {
+      "add": [
+        "f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f"
+      ],
+      "sub": [
+        "02030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f2021"
+      ],
+      "base": "8a566a836f687bb9309abece322b70efe8dbbb2fe870b40400137625854148d0104c473cc0438663a6dc642a65213ad9fc6564aaf1981469a0600494286d4dc945d54f8d6ef2c1a5cb7b294480245c437ac8430e262a7acea101ebca5683183b1fae5cf77c020f7a3a4374a1682810c616e40aaf6996d4cbcc520f07da098afc",
+      "result": "e7a841f937aea10818e1650f86235e06ca3682b5e14ce245d79f5d64b2e442a108f5be7a1a9bc5124da5a3fba2052b3da3c2dbb5a2f80a11ae7e130a8c35b068e0b483314b7f08cbbafeabd6d57d555560f1c31ca54ac47942cc255ae1a60d336c9a8dc4bd56478564e8c118c3c7d8931e50d83cc8a7debef36f020d258d742b"
+    },
+    {
+      "add": [],
+      "sub": [
+        "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
+      ],
+      "base": "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "result": "643be7ebba4111cd940dc596e613a0cf73f76aa3f9f93acc5c880bcfb516370701f82b1099c4fb79696c63fde3fe566592fecfa599e68b3210f2369fab66f5bf806a1b340cd58bdcab735fd0b184c9e5983a7737cfecf7c5b72d1409a87382cdbc5d6ef245e6ebb36e585158ca7bf5f4e7f12da13995e28ad7fd3729ed3f108f"
+    }
+  ],
+  "patch_mac": {
+    "key": "118fd7a9460b9922a5b1c758a4ee599bb816be2857d428c45632a7b8b76434e5",
+    "mac": "4dc80ff7f868c3dc18aab3772579d5c778026a7210c2a908fac143f362a2a57e",
+    "name": "regular_low",
+    "snapshot_mac": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+    "value_macs": [
+      "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf",
+      "b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecf"
+    ],
+    "version": 12
+  },
+  "snapshot_mac": {
+    "hash": "e7a841f937aea10818e1650f86235e06ca3682b5e14ce245d79f5d64b2e442a108f5be7a1a9bc5124da5a3fba2052b3da3c2dbb5a2f80a11ae7e130a8c35b068e0b483314b7f08cbbafeabd6d57d555560f1c31ca54ac47942cc255ae1a60d336c9a8dc4bd56478564e8c118c3c7d8931e50d83cc8a7debef36f020d258d742b",
+    "key": "381f92773626fc7493b7d6df291ef22cf5419046f1877dc1bc8c5ce1d21bd244",
+    "mac": "e8ad4326218c7b77f19ea16f40faf3a392c110f21984164a2137638cd6d3c0f1",
+    "name": "regular_low",
+    "version": "9"
+  },
+  "steps": [
+    {
+      "name": "archive_false_first",
+      "patch_name": "regular_low",
+      "patch_version": 1,
+      "patch": "12b901080012b4010a220a204c6fa3a9159e40b8e137e382824e687656ed906090f994adfb7a95dce9ca38961283010a8001d3888aea118742adb33f7369fc0c50b9e17d35d7d0dba93f5850917cc8699e6f1a9290a05b92be427d645e97a43e0176abe709414993b9d840d0aa824ad1ac503fb53d4569b0b73c5c7f76db050429928c876cde0ca47073380935ea3c02c90b19921c973bc8eefd006dede54b02199839fabfc5dcf8c049e37cf1eb6e34545a1a080a0600000000002a2220c451e7ad1a3c9bbeac9a4d542840dc93f32e12a4240110bea6fc65c2a0c154892a202436c82ab5c3b398933fe535f8216f2d05319622793f57e0f0da32dd0d035d4332080a0600000000002a",
+      "state_before": {
+        "version": 0,
+        "hash": "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "prior_macs": null,
+      "state_after": {
+        "version": 1,
+        "hash": "2f56c983f2681954d52a03103ca0d8a1a9176a485a9b74549388869903fcae63a70afe0f6c40c7f0c24d0447198df8138df5e39d9ca4e2f9cfaa2f8cc80f2bb5089c79aa27d2cc9992bbbbf1480b5b8bb8e764c6eab00d48531ea9d7c79e4d943dd9a5cfd9b1f0b7b2992263b17029ea9b2e9cd2515773728f7d5b608ee8b519"
+      },
+      "mutations": [
+        {
+          "index": [
+            "archive",
+            "201141465543@s.whatsapp.net"
+          ],
+          "operation": "SET",
+          "version": 3,
+          "index_mac": "4c6fa3a9159e40b8e137e382824e687656ed906090f994adfb7a95dce9ca3896",
+          "value_mac": "19921c973bc8eefd006dede54b02199839fabfc5dcf8c049e37cf1eb6e34545a",
+          "archived": false,
+          "last_message_timestamp": 1700000000,
+          "timestamp": 1700000000000
+        }
+      ],
+      "source": "go-EncodePatch"
+    },
+    {
+      "name": "archive_true_replaces_previous",
+      "patch_name": "regular_low",
+      "patch_version": 2,
+      "patch": "12f901080012f4010a220a204c6fa3a9159e40b8e137e382824e687656ed906090f994adfb7a95dce9ca389612c3010ac0011b28259ae0f911e785ad576e459c6f55c492183a550c5557f889f4f09bcba66ba327c0479294afd613cd9dd0f97c6699cc6ba62843592da1a8a4daa3a79c023268cb03603ac4ba2d3b695efafd3e8ff34b231b7ccdfc97a6355378ad5e1e2af6aadf32c908a5a77ced6122d259611c2081693e2f08f602a650d3d0916300c9b8cf5bc9f876e64ff3879bf0d693034ca47d7cdc4eab2df7bcdd3842b1790a9764ea436c8bbfffc02a3b681bb12558f7b8f10a3a68917d586d3e83fd341120bbf71a080a0600000000002a12a701080012a2010a220a20d87148389486de0c3c777684b1797f5bb5e4f3a8ad1db6af591352dacb9577d512720a704aeab1932068dfbbdc0cbf33d76f7ee720c13f9a7020ad0c0ab4fb6320d5f23393a1527d0c154472775c452fa2738e44eb9fbd82ea52c0d38761aed4f53a46c0e0268ea319853691fd78101f24df3cb2fb98992390d42c1326e85958e556e58d20975762ef23e06a4c4b3225af5fa0221a080a0600000000002a22202f235325d1b4daa4399b715c28eb7f5cf41fa2a5dfa511009c33daa35b4abae32a202dec80e47a7c160b49a37ba783ff503561e77d1336839671a31bcd6de3e765b232080a0600000000002a",
+      "state_before": {
+        "version": 1,
+        "hash": "2f56c983f2681954d52a03103ca0d8a1a9176a485a9b74549388869903fcae63a70afe0f6c40c7f0c24d0447198df8138df5e39d9ca4e2f9cfaa2f8cc80f2bb5089c79aa27d2cc9992bbbbf1480b5b8bb8e764c6eab00d48531ea9d7c79e4d943dd9a5cfd9b1f0b7b2992263b17029ea9b2e9cd2515773728f7d5b608ee8b519"
+      },
+      "prior_macs": [
+        {
+          "index_mac": "4c6fa3a9159e40b8e137e382824e687656ed906090f994adfb7a95dce9ca3896",
+          "value_mac": "19921c973bc8eefd006dede54b02199839fabfc5dcf8c049e37cf1eb6e34545a"
+        }
+      ],
+      "state_after": {
+        "version": 2,
+        "hash": "c994f1955b1f9cdb078afe78b6ac3c15f1a94ae3cf11945fc0577ccdcec5774cb196249d465546c196725c6ebb8309920b94fe1229a9c0471554e1abc91420e39c2321ab5c7858ce6d27f0d8e513d5594fa88d1658fdb269793de80384643917e273a09a31e9a3ac795945bb67e94fda5dead1cd0814d2c8ed1f18e93c74f632"
+      },
+      "mutations": [
+        {
+          "index": [
+            "archive",
+            "201141465543@s.whatsapp.net"
+          ],
+          "operation": "SET",
+          "version": 3,
+          "index_mac": "4c6fa3a9159e40b8e137e382824e687656ed906090f994adfb7a95dce9ca3896",
+          "value_mac": "ea436c8bbfffc02a3b681bb12558f7b8f10a3a68917d586d3e83fd341120bbf7",
+          "archived": true,
+          "last_message_timestamp": 1700000060,
+          "timestamp": 1700000060000
+        },
+        {
+          "index": [
+            "pin_v1",
+            "201141465543@s.whatsapp.net"
+          ],
+          "operation": "SET",
+          "version": 5,
+          "index_mac": "d87148389486de0c3c777684b1797f5bb5e4f3a8ad1db6af591352dacb9577d5",
+          "value_mac": "fb98992390d42c1326e85958e556e58d20975762ef23e06a4c4b3225af5fa022",
+          "pinned": false,
+          "timestamp": 1700000060000
+        }
+      ],
+      "source": "go-EncodePatch"
+    },
+    {
+      "name": "mark_read_with_key",
+      "patch_name": "regular_low",
+      "patch_version": 3,
+      "patch": "12f901080012f4010a220a202b2c10ca52b8f462cff00e9e83e1bfb2a55c71d8014b189edc2355dedc93425212c3010ac0019bcd5b6241f9f2c042720c04c8ad2c20e3f8ed7ab0ae9abb20d595dc52c135ab282c8733c4a49e2f68388edf80810219acc2167765ac28102ffe677b079d751ac7a78158415e7f1763d5dc6e716b3ff0a8049476934e8e4c3de7253a8202d5badc87b7fdb722a87192ea3b6845441ed58f65b6abf47c496703bed6005a4f180a7155d7e73abe44d2abfd0b08d2fe8b44186bdb3d3a1d401149c732651ccd86097c48a3add927a2f2888909b85405ac2aa9deb23ff354392ce2acd646db50871d1a080a0600000000002a222006b929de3497c2b83284ebec12faec3b0d3c1743f195c348a1272094889080152a203a52657a3b148feaa91d56b7bc201a8c4a307cba9e48faca4c788b981b83aaf032080a0600000000002a",
+      "state_before": {
+        "version": 2,
+        "hash": "c994f1955b1f9cdb078afe78b6ac3c15f1a94ae3cf11945fc0577ccdcec5774cb196249d465546c196725c6ebb8309920b94fe1229a9c0471554e1abc91420e39c2321ab5c7858ce6d27f0d8e513d5594fa88d1658fdb269793de80384643917e273a09a31e9a3ac795945bb67e94fda5dead1cd0814d2c8ed1f18e93c74f632"
+      },
+      "prior_macs": [
+        {
+          "index_mac": "4c6fa3a9159e40b8e137e382824e687656ed906090f994adfb7a95dce9ca3896",
+          "value_mac": "ea436c8bbfffc02a3b681bb12558f7b8f10a3a68917d586d3e83fd341120bbf7"
+        },
+        {
+          "index_mac": "d87148389486de0c3c777684b1797f5bb5e4f3a8ad1db6af591352dacb9577d5",
+          "value_mac": "fb98992390d42c1326e85958e556e58d20975762ef23e06a4c4b3225af5fa022"
+        }
+      ],
+      "state_after": {
+        "version": 3,
+        "hash": "01c357b8a002a9f6015180c2599fe32b7f7cd7e5e00caeacfa69e80f0d1ef4d346e11eaab6a0af8d50a6b3e36c9670b2d60158e912fdbcf17b8e7584db1fa6c162f2e6caa41de9b18052e8b63c900136033037f3a7c55e97e22ad8f4a3f81e47d2b66010b3f6949952f83a22890885b1f49571aa059315813210d5cdfabed4d0"
+      },
+      "mutations": [
+        {
+          "index": [
+            "markChatAsRead",
+            "201141465543@s.whatsapp.net"
+          ],
+          "operation": "SET",
+          "version": 3,
+          "index_mac": "2b2c10ca52b8f462cff00e9e83e1bfb2a55c71d8014b189edc2355dedc934252",
+          "value_mac": "7c48a3add927a2f2888909b85405ac2aa9deb23ff354392ce2acd646db50871d",
+          "read": true,
+          "last_message_timestamp": 1700000120,
+          "timestamp": 1700000120000,
+          "message_key_id": "3EB0ABCDEF0123456789"
+        }
+      ],
+      "source": "go-EncodePatch"
+    },
+    {
+      "name": "mark_unread_no_key",
+      "patch_name": "regular_low",
+      "patch_version": 4,
+      "patch": "12b901080012b4010a220a202b2c10ca52b8f462cff00e9e83e1bfb2a55c71d8014b189edc2355dedc9342521283010a8001167825e98dae50d66ab1d7899fe769171d8b4134f4a6cc07242e66aff7ee7dbe2c1d1c5d89e95440c71cb0f9c25860c2418523ba2d158390fc10a2a95a228d233ef6385c71458a90401385112795a8dd74118ba76a0e9c3828df55c60dd3fbe489e40096c046f7f025f13370d161671921333573f2b6ed7990f82e0c6d98d62e1a080a0600000000002a2220947f17c35ea59bedd852e6cd8d1e732f2446ab74a4af6238749b469b0f3de7982a207e7638f0482ee132dfdbf1e6b5286305cd84fb7ba9ad27ba94dd9a385e1b1fac32080a0600000000002a",
+      "state_before": {
+        "version": 3,
+        "hash": "01c357b8a002a9f6015180c2599fe32b7f7cd7e5e00caeacfa69e80f0d1ef4d346e11eaab6a0af8d50a6b3e36c9670b2d60158e912fdbcf17b8e7584db1fa6c162f2e6caa41de9b18052e8b63c900136033037f3a7c55e97e22ad8f4a3f81e47d2b66010b3f6949952f83a22890885b1f49571aa059315813210d5cdfabed4d0"
+      },
+      "prior_macs": [
+        {
+          "index_mac": "4c6fa3a9159e40b8e137e382824e687656ed906090f994adfb7a95dce9ca3896",
+          "value_mac": "ea436c8bbfffc02a3b681bb12558f7b8f10a3a68917d586d3e83fd341120bbf7"
+        },
+        {
+          "index_mac": "d87148389486de0c3c777684b1797f5bb5e4f3a8ad1db6af591352dacb9577d5",
+          "value_mac": "fb98992390d42c1326e85958e556e58d20975762ef23e06a4c4b3225af5fa022"
+        },
+        {
+          "index_mac": "2b2c10ca52b8f462cff00e9e83e1bfb2a55c71d8014b189edc2355dedc934252",
+          "value_mac": "7c48a3add927a2f2888909b85405ac2aa9deb23ff354392ce2acd646db50871d"
+        }
+      ],
+      "state_after": {
+        "version": 4,
+        "hash": "500c1f276e6e9ddd8a50da1e2f9a526c05194892077e73a43e8fa6d198b11de43f3bb0a622062d90da01a31a0b5c77ad79100da3b2aa7d6ebec3be9b7a3319137cab05cde8520a41aa9d4c971564c02cc5e70f9ef19bfb8def3f444adeade49aec52b8a592df26c804b073c753d02faa7438ae99379865081748fb856f7ecbb2"
+      },
+      "mutations": [
+        {
+          "index": [
+            "markChatAsRead",
+            "201141465543@s.whatsapp.net"
+          ],
+          "operation": "SET",
+          "version": 3,
+          "index_mac": "2b2c10ca52b8f462cff00e9e83e1bfb2a55c71d8014b189edc2355dedc934252",
+          "value_mac": "89e40096c046f7f025f13370d161671921333573f2b6ed7990f82e0c6d98d62e",
+          "read": false,
+          "last_message_timestamp": 1700000180,
+          "timestamp": 1700000180000
+        }
+      ],
+      "source": "go-EncodePatch"
+    },
+    {
+      "name": "archive_group",
+      "patch_name": "regular_low",
+      "patch_version": 5,
+      "patch": "12b901080012b4010a220a20d3856539d6cc4c42fd81146053c8443a48e509899f4d78f1baca3cff758e021d1283010a8001693ac2d3945399d6ed19a41962b676aa2b7edca0ebdb3b7d58b0c9506201ef9943c6b75afce6c635785613af75bad19d6266620b54b64abc66aec454a4231833df334cca49f6486aac6688d19733b71f314d0c0b1fd6f04d46bf99c1b1c00487ac5b89edc48bd7e01ac07c6e2f56b5865c14d5448dcd9cba3d92657f8f61babb1a080a0600000000002a12a701080012a2010a220a206be1d8609fee1d86daf90d6a19c3aed2222ebb2a0a9a4341b4bace102b3839b712720a707f4f13575e6e130bc9d099a9d1c923d61b8ad490113281ce88f2186c128df2f5b4508f955d9ba9084886edd8f16a30b084ca93f882848af9e82d72d52efa1943b41c4785a70d5d38b28463e3d61b9de0d94bc54e69bc16ffa3dba79ebb8c41c04537be0356b186f24d1f500ca435d2e31a080a0600000000002a22209e8ce527f162832b04a7c4e2238e6fb67e7e75d688fed5ca152b4ab977b91ce02a20302fe6bdbaa1b999641f5ec75367704140c0249f2e2730d7bbce65761d81654832080a0600000000002a",
+      "state_before": {
+        "version": 4,
+        "hash": "500c1f276e6e9ddd8a50da1e2f9a526c05194892077e73a43e8fa6d198b11de43f3bb0a622062d90da01a31a0b5c77ad79100da3b2aa7d6ebec3be9b7a3319137cab05cde8520a41aa9d4c971564c02cc5e70f9ef19bfb8def3f444adeade49aec52b8a592df26c804b073c753d02faa7438ae99379865081748fb856f7ecbb2"
+      },
+      "prior_macs": [
+        {
+          "index_mac": "4c6fa3a9159e40b8e137e382824e687656ed906090f994adfb7a95dce9ca3896",
+          "value_mac": "ea436c8bbfffc02a3b681bb12558f7b8f10a3a68917d586d3e83fd341120bbf7"
+        },
+        {
+          "index_mac": "d87148389486de0c3c777684b1797f5bb5e4f3a8ad1db6af591352dacb9577d5",
+          "value_mac": "fb98992390d42c1326e85958e556e58d20975762ef23e06a4c4b3225af5fa022"
+        },
+        {
+          "index_mac": "2b2c10ca52b8f462cff00e9e83e1bfb2a55c71d8014b189edc2355dedc934252",
+          "value_mac": "89e40096c046f7f025f13370d161671921333573f2b6ed7990f82e0c6d98d62e"
+        }
+      ],
+      "state_after": {
+        "version": 5,
+        "hash": "3ed960147e8afaae758dc79bf75c0eb70a08db7bfb099f31755b8093e89a0725d608e363a2c2e11ed838397e1909dfae0b84593de63c96254b105dbe28720d8c4fa01c4ca06ac08580a26a7a9bbe02a0deee79cfff3c84efdbdd4301f9393b07ce5cdc1619ee3f1a03d91ac1ee10191a43221d69f40ce1bef1f8e088053a53dc"
+      },
+      "mutations": [
+        {
+          "index": [
+            "archive",
+            "120363025246125486@g.us"
+          ],
+          "operation": "SET",
+          "version": 3,
+          "index_mac": "d3856539d6cc4c42fd81146053c8443a48e509899f4d78f1baca3cff758e021d",
+          "value_mac": "ac5b89edc48bd7e01ac07c6e2f56b5865c14d5448dcd9cba3d92657f8f61babb",
+          "archived": true,
+          "last_message_timestamp": 1700000240,
+          "timestamp": 1700000240000
+        },
+        {
+          "index": [
+            "pin_v1",
+            "120363025246125486@g.us"
+          ],
+          "operation": "SET",
+          "version": 5,
+          "index_mac": "6be1d8609fee1d86daf90d6a19c3aed2222ebb2a0a9a4341b4bace102b3839b7",
+          "value_mac": "d94bc54e69bc16ffa3dba79ebb8c41c04537be0356b186f24d1f500ca435d2e3",
+          "pinned": false,
+          "timestamp": 1700000240000
+        }
+      ],
+      "source": "go-EncodePatch"
+    },
+    {
+      "name": "remove_mark_read",
+      "patch_name": "regular_low",
+      "patch_version": 6,
+      "patch": "0a02080612b901080112b4010a220a202b2c10ca52b8f462cff00e9e83e1bfb2a55c71d8014b189edc2355dedc9342521283010a80017bd739eedd14112db303eb2fdfab7deade61b8ecde22a8ea1d48598d1a8f75510616a9ba9d1dab7a482de6be5b8132f0c56a27c55584c77a30762aae397cabada6aef2da06788aa2c8c1c2f3c6c1941cc6cd4e0757081f622521f640d98d3013b908085d79cc035872890a6a4f3d193bba15e44fdf0f00e2c170bc71fcee34f01a080a0600000000002a22208228d0e782d165833eb1b06cd4d7dad65013a04b8bcffe83e5f1c8b14fbabc5e2a20a15999047d071574a0d4a9449d3c53d6d7a5f59472df8b8fc3ad40c382d63dcd32080a0600000000002a",
+      "state_before": {
+        "version": 5,
+        "hash": "3ed960147e8afaae758dc79bf75c0eb70a08db7bfb099f31755b8093e89a0725d608e363a2c2e11ed838397e1909dfae0b84593de63c96254b105dbe28720d8c4fa01c4ca06ac08580a26a7a9bbe02a0deee79cfff3c84efdbdd4301f9393b07ce5cdc1619ee3f1a03d91ac1ee10191a43221d69f40ce1bef1f8e088053a53dc"
+      },
+      "prior_macs": [
+        {
+          "index_mac": "4c6fa3a9159e40b8e137e382824e687656ed906090f994adfb7a95dce9ca3896",
+          "value_mac": "ea436c8bbfffc02a3b681bb12558f7b8f10a3a68917d586d3e83fd341120bbf7"
+        },
+        {
+          "index_mac": "d87148389486de0c3c777684b1797f5bb5e4f3a8ad1db6af591352dacb9577d5",
+          "value_mac": "fb98992390d42c1326e85958e556e58d20975762ef23e06a4c4b3225af5fa022"
+        },
+        {
+          "index_mac": "2b2c10ca52b8f462cff00e9e83e1bfb2a55c71d8014b189edc2355dedc934252",
+          "value_mac": "89e40096c046f7f025f13370d161671921333573f2b6ed7990f82e0c6d98d62e"
+        },
+        {
+          "index_mac": "d3856539d6cc4c42fd81146053c8443a48e509899f4d78f1baca3cff758e021d",
+          "value_mac": "ac5b89edc48bd7e01ac07c6e2f56b5865c14d5448dcd9cba3d92657f8f61babb"
+        },
+        {
+          "index_mac": "6be1d8609fee1d86daf90d6a19c3aed2222ebb2a0a9a4341b4bace102b3839b7",
+          "value_mac": "d94bc54e69bc16ffa3dba79ebb8c41c04537be0356b186f24d1f500ca435d2e3"
+        }
+      ],
+      "state_after": {
+        "version": 6,
+        "hash": "b76132836b3bf9acf2c6ebf57e6ff85ff698ddccc39dc0ecf723568f1eaf618d4864575ac611fa4f94a9f2d1c93071939d074aad5d3bd9fea2a080ce7753145c6f18382a14900e13432c0ebc6b6e17cd68aff747669e3bcb65dbe7ba9ff09083c47dc40bb8f7bcfe7882ecb4022a394a2cd4409dc5884e7fc7d0fdebd22f7e5c"
+      },
+      "mutations": [
+        {
+          "index": [
+            "markChatAsRead",
+            "201141465543@s.whatsapp.net"
+          ],
+          "operation": "REMOVE",
+          "version": 3,
+          "index_mac": "2b2c10ca52b8f462cff00e9e83e1bfb2a55c71d8014b189edc2355dedc934252",
+          "value_mac": "b908085d79cc035872890a6a4f3d193bba15e44fdf0f00e2c170bc71fcee34f0",
+          "read": false,
+          "timestamp": 1700000300000
+        }
+      ],
+      "source": "go-handbuilt-REMOVE-decoded-by-go"
+    },
+    {
+      "name": "dup_set_same_index",
+      "patch_name": "regular_low",
+      "patch_version": 7,
+      "patch": "0a02080712a701080012a2010a220a209c9875a7684dfb6d0f5e1a385e56dc1d75363355275a58d65ec22acaddcc142d12720a7001bece5a8d0a32442f96c7e6d833417699d4151bf7b7fd4f0a2d96a1ac1294bff3312401e109f6c8ef65c989d37c87287da19b9ce443596a6c0ef8cdb72e329932d57d03682a0225b2b2dab40f66e648bd5c1da09e32881c7989120e3d6ee6554f1c73cf563992c9cdc90d27863377f31a080a0600000000002a12a701080012a2010a220a209c9875a7684dfb6d0f5e1a385e56dc1d75363355275a58d65ec22acaddcc142d12720a70be784537537620da905534368b63b48229651ee61983fc140b12606fc3ae62e96f11e5d8c9785afd4157de9d8133fe901e4f8954de1b310209ddbb613bf0171403cb773da013387307d49bc6c4ad67a9c482b588ee3245bb3f4820f52239173f042521bfc5d2624314179067c1cd73911a080a0600000000002a2220a599c39f3f4cc5d54bc6049df298cc2a5f3b078c2f3fc22acb99e9eb07848cb32a20b9d7d28aadc27d1815b2960f30904aee851f062fd13e5bfa584f03242f452f1b32080a0600000000002a",
+      "state_before": {
+        "version": 6,
+        "hash": "b76132836b3bf9acf2c6ebf57e6ff85ff698ddccc39dc0ecf723568f1eaf618d4864575ac611fa4f94a9f2d1c93071939d074aad5d3bd9fea2a080ce7753145c6f18382a14900e13432c0ebc6b6e17cd68aff747669e3bcb65dbe7ba9ff09083c47dc40bb8f7bcfe7882ecb4022a394a2cd4409dc5884e7fc7d0fdebd22f7e5c"
+      },
+      "prior_macs": [
+        {
+          "index_mac": "6be1d8609fee1d86daf90d6a19c3aed2222ebb2a0a9a4341b4bace102b3839b7",
+          "value_mac": "d94bc54e69bc16ffa3dba79ebb8c41c04537be0356b186f24d1f500ca435d2e3"
+        },
+        {
+          "index_mac": "4c6fa3a9159e40b8e137e382824e687656ed906090f994adfb7a95dce9ca3896",
+          "value_mac": "ea436c8bbfffc02a3b681bb12558f7b8f10a3a68917d586d3e83fd341120bbf7"
+        },
+        {
+          "index_mac": "d87148389486de0c3c777684b1797f5bb5e4f3a8ad1db6af591352dacb9577d5",
+          "value_mac": "fb98992390d42c1326e85958e556e58d20975762ef23e06a4c4b3225af5fa022"
+        },
+        {
+          "index_mac": "d3856539d6cc4c42fd81146053c8443a48e509899f4d78f1baca3cff758e021d",
+          "value_mac": "ac5b89edc48bd7e01ac07c6e2f56b5865c14d5448dcd9cba3d92657f8f61babb"
+        }
+      ],
+      "state_after": {
+        "version": 7,
+        "hash": "1b478bf6924796641140742d0284bc316a590b71ed21a8638a23fba4bff257c2c073cf5daa83c5df2ea3f4ccbedce3545a811e958e5f96211cdcbad59ddf2d9b1e945d8751fd41d4f67d6a55f62b813e1d4e3b5949f4b31c8e72443f90ef9b991d2a4f2e4907ec13dd1d2eaa53d20f5de478e85867e517116915ca6088f40de9"
+      },
+      "mutations": [
+        {
+          "index": [
+            "archive",
+            "100000000001@s.whatsapp.net"
+          ],
+          "operation": "SET",
+          "version": 3,
+          "index_mac": "9c9875a7684dfb6d0f5e1a385e56dc1d75363355275a58d65ec22acaddcc142d",
+          "value_mac": "bd5c1da09e32881c7989120e3d6ee6554f1c73cf563992c9cdc90d27863377f3",
+          "archived": false,
+          "timestamp": 1700000600000
+        },
+        {
+          "index": [
+            "archive",
+            "100000000001@s.whatsapp.net"
+          ],
+          "operation": "SET",
+          "version": 3,
+          "index_mac": "9c9875a7684dfb6d0f5e1a385e56dc1d75363355275a58d65ec22acaddcc142d",
+          "value_mac": "c482b588ee3245bb3f4820f52239173f042521bfc5d2624314179067c1cd7391",
+          "archived": true,
+          "timestamp": 1700000660000
+        }
+      ],
+      "source": "go-handbuilt-exotic-state-computed-by-go"
+    },
+    {
+      "name": "set_then_remove_same_patch",
+      "patch_name": "regular_low",
+      "patch_version": 8,
+      "patch": "0a02080812a701080012a2010a220a201a59e6d72e64993a73bb3a5198e021f563b6fb4d12afdead7b36dfa4e60a80b912720a706f0cfffc9cb3e323c5b3cea36388975fa993aa13b0f532c79e54ee71fd902bf9b4dc63a7ef6c0f36b56ff5a4062677520b1924aa6e26dffd063d872443cf43c49e198e8ad3498f404cbe9df442afc271a61cc31f20f5cbc954c47a47373684674da33fe6c79d3de04ae4ed92745023a21a080a0600000000002a12a701080112a2010a220a201a59e6d72e64993a73bb3a5198e021f563b6fb4d12afdead7b36dfa4e60a80b912720a700d0690b167ada59adfccbd947607cf5fa6061f2d47e14e504193928baedd2e97339b9a3f4699a209c87eca2a86c032ca80aa0c50b9af23f6291383e7295fe21d589418ed3adfc30237ccfca1bb3129a7b48d8e116ef0b8e4b5f62d1e1f90cf284c624d932e3a26fd32ca4615da4236911a080a0600000000002a2220507d245f0b5c7ccdcaa8fee2f41a5fe1d408b27e40eef4596ee60f6261f46c3c2a20bcffdd98912f362762dac60e0e7ac8593adfc2e23f84b589bd3d8074a41605f432080a0600000000002a",
+      "state_before": {
+        "version": 7,
+        "hash": "1b478bf6924796641140742d0284bc316a590b71ed21a8638a23fba4bff257c2c073cf5daa83c5df2ea3f4ccbedce3545a811e958e5f96211cdcbad59ddf2d9b1e945d8751fd41d4f67d6a55f62b813e1d4e3b5949f4b31c8e72443f90ef9b991d2a4f2e4907ec13dd1d2eaa53d20f5de478e85867e517116915ca6088f40de9"
+      },
+      "prior_macs": [
+        {
+          "index_mac": "4c6fa3a9159e40b8e137e382824e687656ed906090f994adfb7a95dce9ca3896",
+          "value_mac": "ea436c8bbfffc02a3b681bb12558f7b8f10a3a68917d586d3e83fd341120bbf7"
+        },
+        {
+          "index_mac": "d87148389486de0c3c777684b1797f5bb5e4f3a8ad1db6af591352dacb9577d5",
+          "value_mac": "fb98992390d42c1326e85958e556e58d20975762ef23e06a4c4b3225af5fa022"
+        },
+        {
+          "index_mac": "9c9875a7684dfb6d0f5e1a385e56dc1d75363355275a58d65ec22acaddcc142d",
+          "value_mac": "c482b588ee3245bb3f4820f52239173f042521bfc5d2624314179067c1cd7391"
+        },
+        {
+          "index_mac": "d3856539d6cc4c42fd81146053c8443a48e509899f4d78f1baca3cff758e021d",
+          "value_mac": "ac5b89edc48bd7e01ac07c6e2f56b5865c14d5448dcd9cba3d92657f8f61babb"
+        },
+        {
+          "index_mac": "6be1d8609fee1d86daf90d6a19c3aed2222ebb2a0a9a4341b4bace102b3839b7",
+          "value_mac": "d94bc54e69bc16ffa3dba79ebb8c41c04537be0356b186f24d1f500ca435d2e3"
+        }
+      ],
+      "state_after": {
+        "version": 8,
+        "hash": "1b478bf6924796641140742d0284bc316a590b71ed21a8638a23fba4bff257c2c073cf5daa83c5df2ea3f4ccbedce3545a811e958e5f96211cdcbad59ddf2d9b1e945d8751fd41d4f67d6a55f62b813e1d4e3b5949f4b31c8e72443f90ef9b991d2a4f2e4907ec13dd1d2eaa53d20f5de478e85867e517116915ca6088f40de9"
+      },
+      "mutations": [
+        {
+          "index": [
+            "archive",
+            "100000000002@s.whatsapp.net"
+          ],
+          "operation": "SET",
+          "version": 3,
+          "index_mac": "1a59e6d72e64993a73bb3a5198e021f563b6fb4d12afdead7b36dfa4e60a80b9",
+          "value_mac": "a61cc31f20f5cbc954c47a47373684674da33fe6c79d3de04ae4ed92745023a2",
+          "archived": true,
+          "timestamp": 1700000600000
+        },
+        {
+          "index": [
+            "archive",
+            "100000000002@s.whatsapp.net"
+          ],
+          "operation": "REMOVE",
+          "version": 3,
+          "index_mac": "1a59e6d72e64993a73bb3a5198e021f563b6fb4d12afdead7b36dfa4e60a80b9",
+          "value_mac": "b48d8e116ef0b8e4b5f62d1e1f90cf284c624d932e3a26fd32ca4615da423691",
+          "archived": true,
+          "timestamp": 1700000660000
+        }
+      ],
+      "source": "go-handbuilt-exotic-state-computed-by-go"
+    },
+    {
+      "name": "remove_then_set_same_patch",
+      "patch_name": "regular_low",
+      "patch_version": 9,
+      "patch": "0a02080912a701080112a2010a220a209c9875a7684dfb6d0f5e1a385e56dc1d75363355275a58d65ec22acaddcc142d12720a700132ad79d98cabe4be4664c8bdec37522daac27213ec12c795024b0bf1f909f380534ad743d0be3c28a0043d22aadb5e0d6f34cb326fe702bc26e055c6596f6c3af560114ffb98b8e3057c5dd7b56c466fca90d62d9123a2b17c751ee8993f0c6d105e5995bc3dd1e2b5db55349be1a01a080a0600000000002a12a701080012a2010a220a209c9875a7684dfb6d0f5e1a385e56dc1d75363355275a58d65ec22acaddcc142d12720a703ee634b11d45d1c843c88c7c1fd449df4352e6f10d55c9b86eba4673df9f014fa081d21f53cb64ddc3470e17ec325fb711dd3c5b1c15dd2e777664ed4994569f46a003ad932d6a0c5c83bd23cb07a0d3f4e8991cc29abc185ff3c2678733d1675a5784895058cf6779c97cb39650d5161a080a0600000000002a2220def4c0b00d29d478e6211795ebae8aa9eec9caa2fd36abb3bfcfadd20086eaa62a20f6dc7ef8e3ee4dbd5e76acd5ac51099c7fa85898d600b6ebd8f64c53549bb3e132080a0600000000002a",
+      "state_before": {
+        "version": 8,
+        "hash": "1b478bf6924796641140742d0284bc316a590b71ed21a8638a23fba4bff257c2c073cf5daa83c5df2ea3f4ccbedce3545a811e958e5f96211cdcbad59ddf2d9b1e945d8751fd41d4f67d6a55f62b813e1d4e3b5949f4b31c8e72443f90ef9b991d2a4f2e4907ec13dd1d2eaa53d20f5de478e85867e517116915ca6088f40de9"
+      },
+      "prior_macs": [
+        {
+          "index_mac": "d3856539d6cc4c42fd81146053c8443a48e509899f4d78f1baca3cff758e021d",
+          "value_mac": "ac5b89edc48bd7e01ac07c6e2f56b5865c14d5448dcd9cba3d92657f8f61babb"
+        },
+        {
+          "index_mac": "6be1d8609fee1d86daf90d6a19c3aed2222ebb2a0a9a4341b4bace102b3839b7",
+          "value_mac": "d94bc54e69bc16ffa3dba79ebb8c41c04537be0356b186f24d1f500ca435d2e3"
+        },
+        {
+          "index_mac": "4c6fa3a9159e40b8e137e382824e687656ed906090f994adfb7a95dce9ca3896",
+          "value_mac": "ea436c8bbfffc02a3b681bb12558f7b8f10a3a68917d586d3e83fd341120bbf7"
+        },
+        {
+          "index_mac": "d87148389486de0c3c777684b1797f5bb5e4f3a8ad1db6af591352dacb9577d5",
+          "value_mac": "fb98992390d42c1326e85958e556e58d20975762ef23e06a4c4b3225af5fa022"
+        },
+        {
+          "index_mac": "9c9875a7684dfb6d0f5e1a385e56dc1d75363355275a58d65ec22acaddcc142d",
+          "value_mac": "c482b588ee3245bb3f4820f52239173f042521bfc5d2624314179067c1cd7391"
+        }
+      ],
+      "state_after": {
+        "version": 9,
+        "hash": "c56ab17bcaf7cb1d2753fddb305c5a5b4515d596fde9cc66deda02f58bfa2533995af9c9b7063a1cad180a14e0ed8b6d12e9c3897012540a36470144e6155d9b7adf66958587d5c540813736ae3db4b114c895da76e25a82d9a7ed2c33c717791ed07689136aa7c04a62ae72fba0f07dd026a7c3b4b9be1d7719ea8abb85314a"
+      },
+      "mutations": [
+        {
+          "index": [
+            "archive",
+            "100000000001@s.whatsapp.net"
+          ],
+          "operation": "REMOVE",
+          "version": 3,
+          "index_mac": "9c9875a7684dfb6d0f5e1a385e56dc1d75363355275a58d65ec22acaddcc142d",
+          "value_mac": "6fca90d62d9123a2b17c751ee8993f0c6d105e5995bc3dd1e2b5db55349be1a0",
+          "archived": true,
+          "timestamp": 1700000600000
+        },
+        {
+          "index": [
+            "archive",
+            "100000000001@s.whatsapp.net"
+          ],
+          "operation": "SET",
+          "version": 3,
+          "index_mac": "9c9875a7684dfb6d0f5e1a385e56dc1d75363355275a58d65ec22acaddcc142d",
+          "value_mac": "f4e8991cc29abc185ff3c2678733d1675a5784895058cf6779c97cb39650d516",
+          "archived": false,
+          "timestamp": 1700000660000
+        }
+      ],
+      "source": "go-handbuilt-exotic-state-computed-by-go"
+    },
+    {
+      "name": "remove_without_previous_set",
+      "patch_name": "regular_low",
+      "patch_version": 10,
+      "patch": "0a02080a12a701080112a2010a220a20615d11223c3dba14854a741f6c1b336bd6e5a0afa19e788e5a3c04650e0465b012720a70c4744b35a5636ecd139c47fc4be10dfff0cda6428964a725777eec03eb613baf0011a2b1b9d38afce958312e9e2f4d60e782adcca7144630d29e65eb21fc523bbffe15db75ee93443e29a3c10706dca3b33aa78abb429fe5e9e7fcfb6db6e04c3a3f7bb5c9a04326ec53c2d26225d78d1a080a0600000000002a2220326b230984e0b889b140d64b6031ec443db887f6264b355ee43db774872d49d12a208f28287682191a2f3a3dd3b8bb2966f3ce14686e7c6cc5cd6540c05ea2ead50d32080a0600000000002a",
+      "state_before": {
+        "version": 9,
+        "hash": "c56ab17bcaf7cb1d2753fddb305c5a5b4515d596fde9cc66deda02f58bfa2533995af9c9b7063a1cad180a14e0ed8b6d12e9c3897012540a36470144e6155d9b7adf66958587d5c540813736ae3db4b114c895da76e25a82d9a7ed2c33c717791ed07689136aa7c04a62ae72fba0f07dd026a7c3b4b9be1d7719ea8abb85314a"
+      },
+      "prior_macs": [
+        {
+          "index_mac": "4c6fa3a9159e40b8e137e382824e687656ed906090f994adfb7a95dce9ca3896",
+          "value_mac": "ea436c8bbfffc02a3b681bb12558f7b8f10a3a68917d586d3e83fd341120bbf7"
+        },
+        {
+          "index_mac": "d87148389486de0c3c777684b1797f5bb5e4f3a8ad1db6af591352dacb9577d5",
+          "value_mac": "fb98992390d42c1326e85958e556e58d20975762ef23e06a4c4b3225af5fa022"
+        },
+        {
+          "index_mac": "9c9875a7684dfb6d0f5e1a385e56dc1d75363355275a58d65ec22acaddcc142d",
+          "value_mac": "f4e8991cc29abc185ff3c2678733d1675a5784895058cf6779c97cb39650d516"
+        },
+        {
+          "index_mac": "d3856539d6cc4c42fd81146053c8443a48e509899f4d78f1baca3cff758e021d",
+          "value_mac": "ac5b89edc48bd7e01ac07c6e2f56b5865c14d5448dcd9cba3d92657f8f61babb"
+        },
+        {
+          "index_mac": "6be1d8609fee1d86daf90d6a19c3aed2222ebb2a0a9a4341b4bace102b3839b7",
+          "value_mac": "d94bc54e69bc16ffa3dba79ebb8c41c04537be0356b186f24d1f500ca435d2e3"
+        }
+      ],
+      "state_after": {
+        "version": 10,
+        "hash": "c56ab17bcaf7cb1d2753fddb305c5a5b4515d596fde9cc66deda02f58bfa2533995af9c9b7063a1cad180a14e0ed8b6d12e9c3897012540a36470144e6155d9b7adf66958587d5c540813736ae3db4b114c895da76e25a82d9a7ed2c33c717791ed07689136aa7c04a62ae72fba0f07dd026a7c3b4b9be1d7719ea8abb85314a"
+      },
+      "mutations": [
+        {
+          "index": [
+            "archive",
+            "100000000003@s.whatsapp.net"
+          ],
+          "operation": "REMOVE",
+          "version": 3,
+          "index_mac": "615d11223c3dba14854a741f6c1b336bd6e5a0afa19e788e5a3c04650e0465b0",
+          "value_mac": "b33aa78abb429fe5e9e7fcfb6db6e04c3a3f7bb5c9a04326ec53c2d26225d78d",
+          "archived": true,
+          "timestamp": 1700000600000
+        }
+      ],
+      "source": "go-handbuilt-exotic-state-computed-by-go"
+    }
+  ]
+}
