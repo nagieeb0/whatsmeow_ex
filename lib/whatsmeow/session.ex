@@ -1979,21 +1979,25 @@ defmodule Whatsmeow.Session do
       # Background, like history sync: storing then syncing every collection
       # makes IQ round-trips that call back into this process.
       Task.Supervisor.start_child(Whatsmeow.Media.TaskSup, fn ->
-        case Whatsmeow.AppState.handle_key_share(device_id, share) do
-          :ok ->
-            :ok
-
-          {:error, reason} ->
-            Logger.warning("[whatsmeow] app state key share not stored: #{inspect(reason)}",
-              device_id: device_id
-            )
-        end
+        run_app_state_key_share(device_id, share)
       end)
     end
 
     :ok
   rescue
     _ -> :ok
+  end
+
+  defp run_app_state_key_share(device_id, share) do
+    case Whatsmeow.AppState.handle_key_share(device_id, share) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "[whatsmeow] [#{device_id}] app state key share not stored: #{inspect(reason)}"
+        )
+    end
   end
 
   # Go unwraps `deviceSentMessage` before looking at protocol messages.

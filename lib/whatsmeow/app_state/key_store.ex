@@ -28,19 +28,17 @@ defmodule Whatsmeow.AppState.KeyStore do
           {:ok, [binary()]} | {:error, term()}
   def put_key_share(our_jid, %WAWebProtobufsE2E.AppStateSyncKeyShare{keys: keys}, opts \\ [])
       when is_binary(our_jid) do
-    with {:ok, store} <- store(opts) do
-      (keys || [])
-      |> Enum.reduce_while({:ok, []}, fn key, {:ok, ids} ->
-        case put_key(store, our_jid, key) do
-          {:ok, id} -> {:cont, {:ok, [id | ids]}}
-          :skip -> {:cont, {:ok, ids}}
-          {:error, _} = err -> {:halt, err}
-        end
-      end)
-      |> case do
-        {:ok, ids} -> {:ok, Enum.reverse(ids)}
-        err -> err
-      end
+    with {:ok, store} <- store(opts),
+         {:ok, ids} <- Enum.reduce_while(keys || [], {:ok, []}, &put_one(store, our_jid, &1, &2)) do
+      {:ok, Enum.reverse(ids)}
+    end
+  end
+
+  defp put_one(store, our_jid, key, {:ok, ids}) do
+    case put_key(store, our_jid, key) do
+      {:ok, id} -> {:cont, {:ok, [id | ids]}}
+      :skip -> {:cont, {:ok, ids}}
+      {:error, _} = err -> {:halt, err}
     end
   end
 

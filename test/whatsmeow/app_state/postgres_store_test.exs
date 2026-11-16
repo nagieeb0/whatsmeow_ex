@@ -6,12 +6,12 @@ defmodule Whatsmeow.AppState.Store.PostgresTest do
   use ExUnit.Case, async: false
 
   alias Ecto.Adapters.SQL
+  alias WAWebProtobufSyncAction, as: SA
   alias Whatsmeow.AppState
   alias Whatsmeow.AppState.{Hash, KeyStore}
   alias Whatsmeow.AppState.Store.Postgres
   alias Whatsmeow.AppStateFake, as: Fake
   alias Whatsmeow.Repo
-  alias WAWebProtobufSyncAction, as: SA
 
   setup do
     start_supervised!({Repo, pool_size: 2})

@@ -16,8 +16,8 @@ defmodule Whatsmeow.AppState.Patch do
     filled in at encode time as Go does
   """
 
-  alias Whatsmeow.Types.JID
   alias WAWebProtobufSyncAction, as: SA
+  alias Whatsmeow.Types.JID
 
   @index_archive "archive"
   @index_pin "pin_v1"

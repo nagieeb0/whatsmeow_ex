@@ -23,7 +23,7 @@ defmodule Whatsmeow.AppState.Processor do
   Context: `%{jid: our_jid, store: module}` (see `Whatsmeow.AppState.Store`).
   """
 
-  alias Whatsmeow.AppState.{Decode, Hash, KeyStore, Keys}
+  alias Whatsmeow.AppState.{Decode, Hash, Keys, KeyStore}
   alias Whatsmeow.AppState.Sync.PatchList
 
   @type mutation :: %{
@@ -54,15 +54,21 @@ defmodule Whatsmeow.AppState.Processor do
           {:ok, [mutation()], Hash.t()} | {:error, term()}
   def decode_patches(ctx, %PatchList{name: name} = list, %Hash{} = state, validate? \\ true) do
     with {:ok, muts, state} <- maybe_snapshot(ctx, name, list.snapshot, state, validate?) do
-      Enum.reduce_while(list.patches || [], {:ok, muts, state}, fn patch, {:ok, acc, st} ->
-        case decode_patch(ctx, name, patch, st, validate?) do
-          {:ok, new_muts, new_st} -> {:cont, {:ok, acc ++ new_muts, new_st}}
-          {:error, _} = err -> {:halt, err}
-        end
-      end)
+      Enum.reduce_while(
+        list.patches || [],
+        {:ok, muts, state},
+        &apply_one(ctx, name, validate?, &1, &2)
+      )
     end
   catch
     {:store_error, reason} -> {:error, {:store, reason}}
+  end
+
+  defp apply_one(ctx, name, validate?, patch, {:ok, acc, state}) do
+    case decode_patch(ctx, name, patch, state, validate?) do
+      {:ok, new_muts, new_state} -> {:cont, {:ok, acc ++ new_muts, new_state}}
+      {:error, _} = err -> {:halt, err}
+    end
   end
 
   @doc """
@@ -123,22 +129,34 @@ defmodule Whatsmeow.AppState.Processor do
       in_patch = List.to_tuple(inputs)
 
       {:ok, hashed, _warnings} =
-        Hash.update(%Hash{state | version: version}, inputs, fn index_mac, i ->
-          case previous_in_patch(in_patch, index_mac, i - 1) do
-            :not_found -> stored_mac!(ctx, name, index_mac)
-            found -> found
-          end
-        end)
+        Hash.update(
+          %Hash{state | version: version},
+          inputs,
+          &previous_value(ctx, name, in_patch, &1, &2)
+        )
 
-      value_macs = Enum.map(inputs, & &1.value_mac)
+      verify_and_store_patch(ctx, name, patch, hashed, inputs, keys, validate?)
+    end
+  end
 
-      with :ok <-
-             maybe_verify_snapshot(validate?, hashed, name, keys, patch.keyID, patch.snapshotMAC),
-           :ok <- maybe_verify_patch_mac(validate?, patch, value_macs, version, name, keys),
-           {:ok, decoded, removed, added} <- decode_mutations(mutations, keys, validate?, version),
-           :ok <- store(ctx, name, hashed, removed, added, []) do
-        {:ok, decoded, hashed}
-      end
+  defp verify_and_store_patch(ctx, name, patch, hashed, inputs, keys, validate?) do
+    version = hashed.version
+    mutations = patch.mutations || []
+    value_macs = Enum.map(inputs, & &1.value_mac)
+
+    with :ok <-
+           maybe_verify_snapshot(validate?, hashed, name, keys, patch.keyID, patch.snapshotMAC),
+         :ok <- maybe_verify_patch_mac(validate?, patch, value_macs, version, name, keys),
+         {:ok, decoded, removed, added} <- decode_mutations(mutations, keys, validate?, version),
+         :ok <- store(ctx, name, hashed, removed, added, []) do
+      {:ok, decoded, hashed}
+    end
+  end
+
+  defp previous_value(ctx, name, in_patch, index_mac, i) do
+    case previous_in_patch(in_patch, index_mac, i - 1) do
+      :not_found -> stored_mac!(ctx, name, index_mac)
+      found -> found
     end
   end
 
@@ -219,22 +237,31 @@ defmodule Whatsmeow.AppState.Processor do
   defp decode_mutations(mutations, keys, validate?, patch_version) do
     mutations
     |> Enum.with_index(1)
-    |> Enum.reduce_while({:ok, [], [], []}, fn {m, i}, {:ok, decoded, removed, added} ->
-      case decode_mutation(m, keys, validate?, patch_version) do
-        {:ok, %{operation: :remove, index_mac: imac} = mut} ->
-          added = Enum.reject(added, fn {a, _} -> :crypto.hash_equals(a, imac) end)
-          {:cont, {:ok, [mut | decoded], [imac | removed], added}}
-
-        {:ok, %{operation: :set, index_mac: imac, value_mac: vmac} = mut} ->
-          {:cont, {:ok, [mut | decoded], removed, added ++ [{imac, vmac}]}}
-
-        {:error, reason} ->
-          {:halt, {:error, {reason, {:mutation, i}}}}
-      end
-    end)
+    |> Enum.reduce_while(
+      {:ok, [], [], []},
+      &collect_mutation(&1, &2, keys, validate?, patch_version)
+    )
     |> case do
-      {:ok, decoded, removed, added} -> {:ok, Enum.reverse(decoded), Enum.reverse(removed), added}
-      err -> err
+      {:ok, decoded, removed, added} ->
+        {:ok, Enum.reverse(decoded), Enum.reverse(removed), Enum.reverse(added)}
+
+      err ->
+        err
+    end
+  end
+
+  # Accumulators are built reversed; `added` is reversed back at the end.
+  defp collect_mutation({m, i}, {:ok, decoded, removed, added}, keys, validate?, patch_version) do
+    case decode_mutation(m, keys, validate?, patch_version) do
+      {:ok, %{operation: :remove, index_mac: imac} = mut} ->
+        added = Enum.reject(added, fn {a, _} -> a == imac end)
+        {:cont, {:ok, [mut | decoded], [imac | removed], added}}
+
+      {:ok, %{operation: :set, index_mac: imac, value_mac: vmac} = mut} ->
+        {:cont, {:ok, [mut | decoded], removed, [{imac, vmac} | added]}}
+
+      {:error, reason} ->
+        {:halt, {:error, {reason, {:mutation, i}}}}
     end
   end
 

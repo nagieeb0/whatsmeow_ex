@@ -388,22 +388,28 @@ defmodule Whatsmeow.AppStateFake do
              keys.patch_mac,
              patch.patchMAC
            ) do
-      Enum.reduce_while(patch.mutations, :ok, fn m, :ok ->
-        enc = %{
-          operation: if(m.operation == :REMOVE, do: :remove, else: :set),
-          value_blob: m.record.value.blob,
-          index_mac: m.record.index.blob,
-          key_id: m.record.keyID."ID"
-        }
+      Enum.find_value(patch.mutations, :ok, &mutation_error(&1, keys))
+    end
+  end
 
-        with {:ok, %{plaintext: plain}} <- Decode.decode_mutation(enc, keys, true),
-             data = WAWebProtobufSyncAction.SyncActionData.decode(plain),
-             :ok <- Decode.verify_index_mac(data.index, m.record.index.blob, keys) do
-          {:cont, :ok}
-        else
-          err -> {:halt, err}
-        end
-      end)
+  defp mutation_error(m, keys) do
+    case verify_mutation(m, keys) do
+      :ok -> nil
+      err -> err
+    end
+  end
+
+  defp verify_mutation(m, keys) do
+    enc = %{
+      operation: if(m.operation == :REMOVE, do: :remove, else: :set),
+      value_blob: m.record.value.blob,
+      index_mac: m.record.index.blob,
+      key_id: m.record.keyID."ID"
+    }
+
+    with {:ok, %{plaintext: plain}} <- Decode.decode_mutation(enc, keys, true) do
+      data = WAWebProtobufSyncAction.SyncActionData.decode(plain)
+      Decode.verify_index_mac(data.index, m.record.index.blob, keys)
     end
   end
 

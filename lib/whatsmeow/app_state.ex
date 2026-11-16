@@ -50,8 +50,10 @@ defmodule Whatsmeow.AppState do
 
   require Logger
 
-  alias Whatsmeow.AppState.{Encode, Hash, KeyStore, Keys, Patch, Processor, Store, Sync}
+  alias Whatsmeow.AppState.{Encode, Hash, Keys, KeyStore, Patch, Processor, Store, Sync, Tables}
   alias Whatsmeow.Binary.Node
+  alias Whatsmeow.Media.{Download, Refresh, TaskSup}
+  alias Whatsmeow.{Send, Session}
 
   @server_jid "s.whatsapp.net"
   @key_request_interval_ms 24 * 60 * 60 * 1000
@@ -124,12 +126,14 @@ defmodule Whatsmeow.AppState do
   def send_patch(session, %Patch{type: name} = patch, opts \\ []) do
     with {:ok, ctx} <- context(session, opts),
          true <- name in Keys.all_patch_names() || {:error, {:unknown_collection, name}} do
-      with_lock(ctx, fn ->
-        case do_fetch(ctx, name, []) do
-          {:ok, _state} -> do_send(ctx, patch, true, opts)
-          {:error, reason} -> {:error, {:not_synced, reason}}
-        end
-      end)
+      with_lock(ctx, fn -> synced_send(ctx, patch, opts) end)
+    end
+  end
+
+  defp synced_send(ctx, %Patch{type: name} = patch, opts) do
+    case do_fetch(ctx, name, []) do
+      {:ok, _state} -> do_send(ctx, patch, true, opts)
+      {:error, reason} -> {:error, {:not_synced, reason}}
     end
   end
 
@@ -160,24 +164,26 @@ defmodule Whatsmeow.AppState do
   def handle_key_share(session, %WAWebProtobufsE2E.AppStateSyncKeyShare{} = share, opts \\ []) do
     with {:ok, ctx} <- context(session, opts),
          {:ok, ids} <- KeyStore.put_key_share(ctx.jid, share, store: ctx.store) do
-      Logger.debug("[whatsmeow] stored #{length(ids)} app state keys", device_id: ctx.device_id)
+      Logger.debug("[whatsmeow] #{log_id(ctx)}stored #{length(ids)} app state keys")
       re_request? = Enum.any?(ids, &requested?(ctx.jid, &1))
-
-      for name <- Keys.all_patch_names() do
-        case fetch_app_state(ctx, name, only_if_not_synced?: not re_request?) do
-          {:ok, _} ->
-            :ok
-
-          {:error, reason} ->
-            Logger.warning("[whatsmeow] app state #{name} sync failed: #{inspect(reason)}",
-              device_id: ctx.device_id
-            )
-        end
-      end
-
-      :ok
+      Enum.each(Keys.all_patch_names(), &sync_after_share(ctx, &1, re_request?))
     end
   end
+
+  defp sync_after_share(ctx, name, re_request?) do
+    case fetch_app_state(ctx, name, only_if_not_synced?: not re_request?) do
+      {:ok, _} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "[whatsmeow] #{log_id(ctx)}app state #{name} sync failed: #{inspect(reason)}"
+        )
+    end
+  end
+
+  defp log_id(%{device_id: id}) when is_binary(id), do: "[#{id}] "
+  defp log_id(_), do: ""
 
   @doc """
   Build the `Context` for a live session. Production code does not need
@@ -192,14 +198,14 @@ defmodule Whatsmeow.AppState do
     store = Keyword.get_lazy(opts, :store, &Store.impl/0)
 
     with {:ok, %{jid: jid}} when is_binary(jid) and jid != "" <-
-           Whatsmeow.Session.get_device(server),
+           Session.get_device(server),
          true <- Store.available?(store) || {:error, :no_store} do
       {:ok,
        %Context{
          jid: jid,
          store: store,
          device_id: if(is_binary(server), do: server, else: nil),
-         iq: fn node -> Whatsmeow.Session.send_iq(server, node, timeout) end,
+         iq: fn node -> Session.send_iq(server, node, timeout) end,
          download: fn ref -> download_blob(server, ref) end,
          request_keys: fn ids -> send_key_request(server, ids) end
        }}
@@ -299,17 +305,21 @@ defmodule Whatsmeow.AppState do
            ),
          {:ok, resp} <- iq(ctx, build_send_iq(name, state.version, bytes)),
          {:ok, collection} <- response_collection(resp) do
-      if Node.attr(collection, "type") == "error" do
-        handle_send_error(ctx, patch, state, collection, allow_retry?, opts)
-      else
-        case do_fetch(ctx, name, []) do
-          {:ok, _} -> :ok
-          {:error, reason} -> {:error, {:resync_failed, reason}}
-        end
-      end
+      if Node.attr(collection, "type") == "error",
+        do: handle_send_error(ctx, patch, state, collection, allow_retry?, opts),
+        else: resync_after_send(ctx, name)
     end
   catch
     {:store_error, reason} -> {:error, {:store, reason}}
+  end
+
+  # Go's sendAppState ends with fetchAppState: our own patch comes back
+  # from the server and is verified like any other before it is stored.
+  defp resync_after_send(ctx, name) do
+    case do_fetch(ctx, name, []) do
+      {:ok, _} -> :ok
+      {:error, reason} -> {:error, {:resync_failed, reason}}
+    end
   end
 
   defp handle_send_error(ctx, %Patch{type: name} = patch, state, collection, allow_retry?, opts) do
@@ -318,9 +328,7 @@ defmodule Whatsmeow.AppState do
     reason = {:app_state_update_failed, name, code, error && Node.attr(error, "text")}
 
     if code == "409" and allow_retry? do
-      Logger.warning("[whatsmeow] app state #{name} conflict, applying and retrying",
-        device_id: ctx.device_id
-      )
+      Logger.warning("[whatsmeow] #{log_id(ctx)}app state #{name} conflict, applying and retrying")
 
       with {:ok, list} <- Sync.parse_collection(collection, ctx.download),
            :ok <- check_snapshot(list, state, state == Hash.new()),
@@ -418,8 +426,7 @@ defmodule Whatsmeow.AppState do
 
     if due != [] do
       Logger.info(
-        "[whatsmeow] requesting app state keys #{inspect(Enum.map(due, &Base.encode16/1))}",
-        device_id: ctx.device_id
+        "[whatsmeow] #{log_id(ctx)}requesting app state keys #{inspect(Enum.map(due, &Base.encode16/1))}"
       )
 
       ctx.request_keys.(due)
@@ -430,11 +437,11 @@ defmodule Whatsmeow.AppState do
 
   defp requested?(jid, key_id), do: :ets.member(key_requests(), {jid, key_id})
 
-  defp key_requests, do: Whatsmeow.AppState.Tables.key_requests()
+  defp key_requests, do: Tables.key_requests()
 
   defp send_key_request(server, ids) do
-    Task.Supervisor.start_child(Whatsmeow.Media.TaskSup, fn ->
-      case Whatsmeow.Send.send_peer_message(server, build_key_request(ids)) do
+    Task.Supervisor.start_child(TaskSup, fn ->
+      case Send.send_peer_message(server, build_key_request(ids)) do
         {:ok, _id} ->
           :ok
 
@@ -458,8 +465,8 @@ defmodule Whatsmeow.AppState do
 
     with true <-
            (is_binary(ref.mediaKey) and byte_size(ref.mediaKey) == 32) || {:error, :bad_media_key},
-         {:ok, conn} <- Whatsmeow.Media.Refresh.refresh(server) do
-      Whatsmeow.Media.Download.fetch_and_decrypt(descriptor, media_conn: conn)
+         {:ok, conn} <- Refresh.refresh(server) do
+      Download.fetch_and_decrypt(descriptor, media_conn: conn)
     end
   end
 

@@ -5,12 +5,12 @@ defmodule Whatsmeow.AppStateTest do
   """
   use ExUnit.Case, async: true
 
+  alias WAWebProtobufSyncAction, as: SA
   alias Whatsmeow.AppState
-  alias Whatsmeow.AppState.{Decode, Encode, Hash, KeyStore, Keys, Patch, Processor}
+  alias Whatsmeow.AppState.{Decode, Encode, Hash, Keys, KeyStore, Patch, Processor}
   alias Whatsmeow.AppState.Store.Memory
   alias Whatsmeow.AppState.Sync.PatchList
   alias Whatsmeow.AppStateFake, as: Fake
-  alias WAWebProtobufSyncAction, as: SA
 
   @digits "1234567890"
   @chat "1234567890@s.whatsapp.net"
@@ -312,6 +312,8 @@ defmodule Whatsmeow.AppStateTest do
     end
   end
 
+  defp no_prev(_index_mac, _i), do: nil
+
   describe "encode then decode" do
     test "a patch we encode verifies with the same keys, and the state matches", %{jid: jid} do
       key_data = :crypto.strong_rand_bytes(32)
@@ -320,10 +322,13 @@ defmodule Whatsmeow.AppStateTest do
       keys = Keys.expand(key_data)
 
       {:ok, %{patch: bytes, state: encoded_state}} =
-        Encode.encode_syncd_patch(Patch.build_archive(@chat, true), keys, key_id, Hash.new(), fn _,
-                                                                                                 _ ->
-          nil
-        end)
+        Encode.encode_syncd_patch(
+          Patch.build_archive(@chat, true),
+          keys,
+          key_id,
+          Hash.new(),
+          &no_prev/2
+        )
 
       patch = WAServerSync.SyncdPatch.decode(bytes)
       patch = %{patch | version: %WAServerSync.SyncdVersion{version: 1}}

@@ -7,6 +7,8 @@ defmodule Whatsmeow.AppState.Tables do
 
   use GenServer
 
+  alias Whatsmeow.AppState.Store.Memory
+
   @key_requests :whatsmeow_app_state_key_requests
 
   def start_link(_opts), do: GenServer.start_link(__MODULE__, nil, name: __MODULE__)
@@ -16,7 +18,7 @@ defmodule Whatsmeow.AppState.Tables do
 
   @impl true
   def init(nil) do
-    for name <- [Whatsmeow.AppState.Store.Memory.table(), @key_requests] do
+    for name <- [Memory.table(), @key_requests] do
       :ets.new(name, [:named_table, :public, :set, read_concurrency: true])
     end
 
