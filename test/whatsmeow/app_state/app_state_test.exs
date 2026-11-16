@@ -277,6 +277,23 @@ defmodule Whatsmeow.AppStateTest do
     end
   end
 
+  test "the key request is Go's APP_STATE_SYNC_KEY_REQUEST protocol message" do
+    msg = AppState.build_key_request([<<1, 2>>, <<3>>])
+    bytes = msg |> WAWebProtobufsE2E.Message.encode() |> IO.iodata_to_binary()
+
+    assert %WAWebProtobufsE2E.Message{
+             protocolMessage: %WAWebProtobufsE2E.ProtocolMessage{
+               type: :APP_STATE_SYNC_KEY_REQUEST,
+               appStateSyncKeyRequest: %WAWebProtobufsE2E.AppStateSyncKeyRequest{
+                 keyIDs: [
+                   %WAWebProtobufsE2E.AppStateSyncKeyId{keyID: <<1, 2>>},
+                   %WAWebProtobufsE2E.AppStateSyncKeyId{keyID: <<3>>}
+                 ]
+               }
+             }
+           } = WAWebProtobufsE2E.Message.decode(bytes)
+  end
+
   describe "KeyStore (memory)" do
     test "stores a share, keeps the newer key, answers latest_key_id", %{jid: jid} do
       share = fn id, data, ts ->

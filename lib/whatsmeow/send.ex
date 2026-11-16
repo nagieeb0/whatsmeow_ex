@@ -1067,6 +1067,7 @@ defmodule Whatsmeow.Send do
                 "to" => own_non_ad,
                 "category" => "peer"
               }
+              |> Map.merge(peer_priority(msg))
 
             children = [Node.new("participants", %{}, participant_nodes)]
 
@@ -1088,6 +1089,15 @@ defmodule Whatsmeow.Send do
       end
     end
   end
+
+  # Go's `preparePeerMessageNode` raises the push priority of an app-state key
+  # request, so the phone wakes to answer it.
+  defp peer_priority(%WAWebProtobufsE2E.Message{
+         protocolMessage: %WAWebProtobufsE2E.ProtocolMessage{type: :APP_STATE_SYNC_KEY_REQUEST}
+       }),
+       do: %{"push_priority" => "high"}
+
+  defp peer_priority(_msg), do: %{}
 
   @doc """
   Build a message that, when sent, deletes (revokes) the previously-sent
