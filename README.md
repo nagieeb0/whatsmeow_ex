@@ -7,6 +7,8 @@ Pure-Elixir port of the [whatsmeow](https://github.com/tulir/whatsmeow) Go libra
 
 > **Status:** API surfaces compiling, cryptographically critical paths covered by RFC-vector and round-trip tests. Live wire pairing depends on protoc-generated modules (Phase 3) — see `plan.md`.
 
+> **Chat archive / mark-as-read** (app-state patches) is available — see [USAGE.md](USAGE.md#archive-and-mark-as-read-app-state-patches). It must be trialled on a spare number before a personal one.
+
 ## Design
 
 - **Pure Elixir/Erlang.** No Rust/C NIFs — only Erlang's stdlib `:crypto`.

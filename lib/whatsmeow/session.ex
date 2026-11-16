@@ -73,6 +73,7 @@ defmodule Whatsmeow.Session do
 
   require Logger
 
+  alias Whatsmeow.AppState.KeyShare
   alias Whatsmeow.Binary
   alias Whatsmeow.ConnectionEvents
   alias Whatsmeow.Crypto.Curve25519
@@ -1697,6 +1698,7 @@ defmodule Whatsmeow.Session do
             # that later decrypts votes on a poll. Dropping a spam message must
             # not silently break history sync.
             _ = maybe_start_history_sync(state, typed_msg, info)
+            _ = maybe_handle_app_state_key_share(state, typed_msg, info)
             _ = maybe_store_message_secret(state, typed_msg, info)
 
             # The receive pipeline runs before anything is broadcast, so a step
@@ -1958,6 +1960,26 @@ defmodule Whatsmeow.Session do
     end
 
     :ok
+  rescue
+    _ -> :ok
+  end
+
+  # --- App-state key share --------------------------------------------------
+
+  # The phone hands us the keys that encrypt app-state (archive, pin, mark-read…)
+  # in an `AppStateSyncKeyShare` protocol message. Like history sync this can only
+  # legitimately come from our own account — Go gates the whole protocol-message
+  # handler on `info.IsFromMe` — and here it matters more: a key we store becomes
+  # the newest one, the one every patch we send is encrypted under, so a share from
+  # anyone else would let them choose it.
+  #
+  # Stored and synced in a task (`handle_share_async/3`): the sync does IQs and a
+  # blob download, and this is the receive loop.
+  defp maybe_handle_app_state_key_share(state, %{raw: raw}, info) do
+    case KeyShare.extract(raw, info.is_from_me? == true) do
+      nil -> :ok
+      share -> KeyShare.handle_share_async(self(), share, state.device_id)
+    end
   rescue
     _ -> :ok
   end

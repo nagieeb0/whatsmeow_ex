@@ -120,7 +120,8 @@ defmodule WhatsmeowEx.MixProject do
       maintainers: ["nagieeb"],
       licenses: ["MPL-2.0"],
       links: %{"GitHub" => @source_url, "Upstream (Go)" => "https://github.com/tulir/whatsmeow"},
-      files: ~w(lib priv .formatter.exs mix.exs README.md LICENSE plan.md examples)
+      files:
+        ~w(lib priv .formatter.exs mix.exs README.md USAGE.md CHANGELOG.md LICENSE plan.md examples)
     ]
   end
 
@@ -129,9 +130,9 @@ defmodule WhatsmeowEx.MixProject do
       main: "Whatsmeow",
       source_ref: "v#{@version}",
       source_url: @source_url,
-      extras: ["README.md", "plan.md"],
+      extras: ["README.md", "USAGE.md", "CHANGELOG.md", "plan.md"],
       groups_for_modules: [
-        "Public API": [Whatsmeow, Whatsmeow.Notifications],
+        "Public API": [Whatsmeow, Whatsmeow.AppState, Whatsmeow.Notifications],
         Session: [Whatsmeow.Session, Whatsmeow.Sessions.Supervisor],
         Pairing: [Whatsmeow.Pair, Whatsmeow.PairCode, Whatsmeow.QRChannel],
         Messaging: [Whatsmeow.Send, Whatsmeow.Receipt, Whatsmeow.Retry, Whatsmeow.MsgSecret],
