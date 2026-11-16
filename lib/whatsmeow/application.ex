@@ -46,6 +46,7 @@ defmodule Whatsmeow.Application do
       Whatsmeow.Retry.RecentCache,
       Whatsmeow.Media.HKDFCache,
       Whatsmeow.User.DeviceCache,
+      Whatsmeow.AppState.Tables,
       Whatsmeow.WAVersion.Refresher
     ]
   end
@@ -62,6 +63,7 @@ defmodule Whatsmeow.Application do
       Whatsmeow.Retry.RecentCache,
       Whatsmeow.Media.HKDFCache,
       Whatsmeow.User.DeviceCache,
+      Whatsmeow.AppState.Tables,
       Whatsmeow.WAVersion.Refresher
     ]
   end
