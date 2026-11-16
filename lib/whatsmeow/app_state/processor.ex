@@ -94,7 +94,7 @@ defmodule Whatsmeow.AppState.Processor do
       end
 
     (snapshot_ids ++ Enum.map(pl.patches, &key_id_of(&1.keyID)))
-    |> Enum.reject(&is_nil/1)
+    |> Enum.reject(&(&1 in [nil, <<>>]))
     |> Enum.uniq()
     |> Enum.filter(fn id ->
       case p.store.get_key(p.our_jid, id) do

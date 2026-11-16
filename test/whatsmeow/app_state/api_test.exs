@@ -137,7 +137,17 @@ defmodule Whatsmeow.AppState.ApiTest do
             {"201141465543:5@s.whatsapp.net",
              {:device_jid_not_allowed, "201141465543:5@s.whatsapp.net"}},
             {"status@broadcast", {:unsupported_chat_jid, "broadcast"}},
-            {"123@newsletter", {:unsupported_chat_jid, "newsletter"}}
+            {"123@newsletter", {:unsupported_chat_jid, "newsletter"}},
+            # a permanent mutation for a chat that cannot exist is worse than an error
+            {" 1@s.whatsapp.net", :invalid_jid},
+            {"+201141465543@s.whatsapp.net", :invalid_jid},
+            {"<&>@s.whatsapp.net", :invalid_jid},
+            {"abc@s.whatsapp.net", :invalid_jid},
+            {"١٢٣@s.whatsapp.net", :invalid_jid},
+            {String.duplicate("1", 41) <> "@s.whatsapp.net", :invalid_jid},
+            {"1-2@s.whatsapp.net", :invalid_jid},
+            {"abc@g.us", :invalid_jid},
+            {"1-@g.us", :invalid_jid}
           ] do
         assert {:error, ^reason} = AppState.archive_chat(nil, bad, nil, ctx.opts),
                "for #{inspect(bad)}"
@@ -147,7 +157,12 @@ defmodule Whatsmeow.AppState.ApiTest do
     end
 
     test "user, LID and group chats are accepted", ctx do
-      for jid <- [@chat, "182909923287057@lid", "120363025246125486@g.us"] do
+      for jid <- [
+            @chat,
+            "182909923287057@lid",
+            "120363025246125486@g.us",
+            "201141465543-1600000000@g.us"
+          ] do
         assert {:ok, _} = AppState.mark_chat_read(nil, jid, nil, ctx.opts), jid
       end
     end
@@ -188,6 +203,47 @@ defmodule Whatsmeow.AppState.ApiTest do
                %{
                  value: %{
                    archiveChatAction: %{messageRange: %{lastMessageTimestamp: 1_700_000_000}}
+                 }
+               },
+               _
+             ] = p.mutations
+    end
+
+    test "an agent on the JID struct is refused" do
+      assert {:error, :invalid_jid} =
+               AppState.chat_jid(%JID{user: "1", server: "s.whatsapp.net", agent: 1})
+    end
+
+    test "a %MessageKey{} in the builder does not raise, and odd key fields are tolerated" do
+      mk = %WACommon.MessageKey{ID: "S", remoteJID: @chat, fromMe: true}
+      p = Patch.build_archive(@chat, true, 1_700_000_000, mk)
+
+      assert [
+               %{
+                 value: %{
+                   archiveChatAction: %{
+                     messageRange: %{messages: [%{timestamp: 1_700_000_000, key: %{ID: "S"}}]}
+                   }
+                 }
+               },
+               _
+             ] = p.mutations
+
+      p =
+        Patch.build_archive(@chat, true, 1_700_000_000, [
+          %{id: "A", participant: 5, from_me: "yes", remote_jid: 7}
+        ])
+
+      assert [
+               %{
+                 value: %{
+                   archiveChatAction: %{
+                     messageRange: %{
+                       messages: [
+                         %{key: %{ID: "A", participant: nil, remoteJID: nil, fromMe: false}}
+                       ]
+                     }
+                   }
                  }
                },
                _

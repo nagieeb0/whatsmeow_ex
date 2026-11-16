@@ -158,14 +158,24 @@ defmodule Whatsmeow.AppState do
 
   def chat_jid(_), do: {:error, :invalid_jid}
 
-  defp validate_chat_jid(%JID{user: user, server: server, device: device} = jid) do
+  # Strict on purpose. The phone looks a chat up by this exact string, and a patch
+  # is permanent — this library only ever emits SETs, so it cannot take back a
+  # mutation for a chat that does not exist. Users and LIDs are digits; a group is
+  # `digits` or `digits-digits`. No agent, no device.
+  defp validate_chat_jid(%JID{user: user, server: server, device: device, agent: agent} = jid) do
     cond do
       user in [nil, ""] -> {:error, :invalid_jid}
       server not in @chat_servers -> {:error, {:unsupported_chat_jid, server}}
       device not in [nil, 0] -> {:error, {:device_jid_not_allowed, JID.to_string(jid)}}
+      agent not in [nil, 0] -> {:error, :invalid_jid}
+      not valid_user?(server, user) -> {:error, :invalid_jid}
       true -> {:ok, JID.to_string(jid)}
     end
   end
+
+  defp valid_user?("g.us", user) when is_binary(user), do: user =~ ~r/\A\d{1,40}(-\d{1,40})?\z/
+  defp valid_user?(_server, user) when is_binary(user), do: user =~ ~r/\A\d{1,40}\z/
+  defp valid_user?(_server, _user), do: false
 
   @doc false
   @spec last_message(last_message()) :: {:ok, integer() | nil, term()} | {:error, term()}

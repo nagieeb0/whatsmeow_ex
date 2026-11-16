@@ -35,6 +35,8 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- (Within the above, from independent review before release) chat JIDs are validated strictly; a send whose answer was never seen reports `{:send_outcome_unknown, _}`; a collection-level error while fetching is an error; key requests skip empty ids and are capped; a `%WACommon.MessageKey{}` no longer crashes the patch builder.
+
 - **App-state content MACs were wrong.** `Whatsmeow.AppState.Hash.content_mac/4` used
   `2` for SET and `3` for REMOVE as the operation byte; Go uses `byte(op) + 1` over a
   protobuf enum where `SET = 0` and `REMOVE = 1`, i.e. `1` and `2`. Every content MAC

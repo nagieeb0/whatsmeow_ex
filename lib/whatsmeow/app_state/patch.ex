@@ -154,7 +154,9 @@ defmodule Whatsmeow.AppState.Patch do
 
   defp key_items(key), do: [key]
 
-  defp item_ts(%{} = m, default), do: normalize_seconds(m[:timestamp]) || default
+  # A `%MessageKey{}` has no timestamp and is not Access-able; only plain maps do.
+  defp item_ts(%MessageKey{}, default), do: default
+  defp item_ts(%{} = m, default), do: normalize_seconds(Map.get(m, :timestamp)) || default
   defp item_ts(_, default), do: default
 
   # A value this large is not seconds (it would be the year 5138): the caller has
@@ -184,7 +186,7 @@ defmodule Whatsmeow.AppState.Patch do
       %MessageKey{
         ID: id,
         remoteJID: stringify(m[:remote_jid] || m[:remoteJID]),
-        fromMe: m[:from_me] || m[:fromMe] || false,
+        fromMe: (m[:from_me] || m[:fromMe]) == true,
         participant: stringify(m[:participant])
       }
     end
@@ -193,4 +195,5 @@ defmodule Whatsmeow.AppState.Patch do
   defp stringify(nil), do: nil
   defp stringify(s) when is_binary(s), do: s
   defp stringify(%JID{} = j), do: JID.to_string(j)
+  defp stringify(_), do: nil
 end

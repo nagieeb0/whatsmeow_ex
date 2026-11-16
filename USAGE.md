@@ -59,11 +59,11 @@ All in the `regular_low` collection, exactly as Go whatsmeow's `BuildArchive`,
 | `mark_chat_read/3` | `["markChatAsRead", jid]` v3 — `read: true` |
 | `mark_chat_unread/3` | `["markChatAsRead", jid]` v3 — `read: false` |
 
-The `jid` must be a chat on `s.whatsapp.net`, `lid` or `g.us`, without a device
-suffix. Anything else is refused up front (`:invalid_jid`,
+The `jid` must be a chat on `s.whatsapp.net`, `lid` or `g.us` — digits only for a
+user or LID, `digits` or `digits-digits` for a group — without a device suffix. Anything else is refused up front (`:invalid_jid`,
 `{:unsupported_chat_jid, server}`, `{:device_jid_not_allowed, jid}`) — the phone
 finds the chat by that exact string, so a wrong one would address a chat that does
-not exist.
+not exist, and this library cannot take a mutation back (it only emits SETs).
 
 ### The last message
 
@@ -116,7 +116,8 @@ the call a little later**. The phone has to be online, and it may not answer.
 | `{:resync_failed, reason}` | **the patch was accepted**; re-reading the collection afterwards failed | do **not** blindly resend; call `Whatsmeow.AppState.sync/3` |
 | `{:self_check_failed, reason}` | our own patch did not verify, so **nothing was sent** | a bug — please report it |
 | `{:mismatching_lthash, v}`, `{:mismatching_patch_mac, v}`, `{:mismatching_content_mac, n}`, `{:mismatching_index_mac, n}` | a patch from the server failed verification | see *Recovery* |
-| `{:iq_error, %{code: _, text: _}}`, `:timeout` | the request itself failed | retry |
+| `{:send_outcome_unknown, reason}` | the patch IQ went out but we never saw the answer (timeout, dropped connection): **the server may have applied it** | call `Whatsmeow.AppState.sync/3` to see; resending archive/read is harmless (idempotent) but may duplicate |
+| `{:iq_error, %{code: _, text: _}}`, `{:collection_error, %{code: _}}`, `:timeout` | the request failed before anything was sent (or the server answered with an error while *reading*) | retry |
 | `:lock_timeout` | another app-state operation on this device is stuck | retry |
 | `{:store, reason}` | persistence failed (e.g. `{:store, :no_store}` without a Repo) | see *Persistence* |
 | `{:exception, msg}`, `{:exit, reason}` | something below raised or exited; it was caught | report it |

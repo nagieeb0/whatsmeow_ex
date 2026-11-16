@@ -284,6 +284,8 @@ defmodule Whatsmeow.AppState.Sync do
     ids =
       ctx.processor
       |> Processor.missing_key_ids(list)
+      # A response can name any key ids it likes; cap what we will ask the phone for.
+      |> Enum.take(20)
       |> then(&Coordinator.claim_key_requests(ctx.our_jid, &1))
 
     if ids != [], do: ctx.request_keys.(ids)
@@ -294,8 +296,12 @@ defmodule Whatsmeow.AppState.Sync do
     iq = build_fetch_patches_iq(name, from_version, snapshot?)
 
     with {:ok, resp} <- iq_result(ctx.send_iq.(iq)),
-         {:ok, collection} <- collection_of(resp) do
+         {:ok, collection} <- collection_of(resp),
+         nil <- collection_error(collection) do
       parse_collection(collection, name, ctx.download)
+    else
+      %{} = error -> {:error, {:collection_error, error}}
+      {:error, _} = err -> err
     end
   end
 
@@ -310,8 +316,8 @@ defmodule Whatsmeow.AppState.Sync do
          state = %Hash{version: version, hash: hash},
          {:ok, enc} <- Processor.encode_patch(ctx.processor, patch, state),
          :ok <- self_check(ctx, patch, enc, state),
-         {:ok, resp} <- iq_result(ctx.send_iq.(build_send_patch_iq(name, version, enc.bytes))),
-         {:ok, collection} <- collection_of(resp) do
+         {:ok, resp} <- send_patch_iq(ctx, build_send_patch_iq(name, version, enc.bytes)),
+         {:ok, collection} <- sent_collection(resp) do
       case collection_error(collection) do
         nil ->
           resync_after_send(ctx, name)
@@ -326,6 +332,24 @@ defmodule Whatsmeow.AppState.Sync do
         error ->
           {:error, {:rejected, error}}
       end
+    end
+  end
+
+  # Once the patch IQ has gone out we may not know whether the server applied it: a
+  # timeout or a dropped connection says nothing about that. Report it as such
+  # rather than as a plain failure, so a caller does not treat "retry" as free. (An
+  # error *answer* from the server is definitive and stays an `:iq_error`.)
+  defp send_patch_iq(ctx, iq) do
+    case ctx.send_iq.(iq) do
+      {:error, reason} -> {:error, {:send_outcome_unknown, reason}}
+      other -> iq_result(other)
+    end
+  end
+
+  defp sent_collection(resp) do
+    case collection_of(resp) do
+      {:ok, _} = ok -> ok
+      {:error, reason} -> {:error, {:send_outcome_unknown, reason}}
     end
   end
 

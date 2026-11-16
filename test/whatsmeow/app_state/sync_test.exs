@@ -11,7 +11,7 @@ defmodule Whatsmeow.AppState.SyncTest do
 
   @moduletag :capture_log
 
-  alias Whatsmeow.AppState.{Coordinator, Hash, Patch, PatchList, Sync}
+  alias Whatsmeow.AppState.{Coordinator, Hash, Patch, PatchList, Processor, Sync}
   alias Whatsmeow.AppState.Store.Memory
   alias Whatsmeow.Binary.Node
   alias Whatsmeow.Test.AppStateFake, as: Fake
@@ -364,6 +364,24 @@ defmodule Whatsmeow.AppState.SyncTest do
                Sync.fetch(nil, @name, opts(ctx, send_iq: err))
     end
 
+    test "a collection-level error is an error, not a silent success", ctx do
+      give_key(ctx)
+
+      err = fn _ ->
+        {:ok,
+         Node.new("iq", %{"type" => "result"}, [
+           Node.new("sync", %{}, [
+             Node.new("collection", %{"name" => @name, "type" => "error"}, [
+               Node.new("error", %{"code" => "500"}, nil)
+             ])
+           ])
+         ])}
+      end
+
+      assert {:error, {:collection_error, %{code: 500}}} =
+               Sync.fetch(nil, @name, opts(ctx, send_iq: err))
+    end
+
     test "a response with no <collection> is an error, not a crash", ctx do
       give_key(ctx)
       none = fn _ -> {:ok, Node.new("iq", %{"type" => "result"}, nil)} end
@@ -387,6 +405,21 @@ defmodule Whatsmeow.AppState.SyncTest do
       assert Coordinator.requested?(@me, @key_id)
 
       assert {:ok, 0, _} = Memory.get_version(@me, @name), "nothing was applied"
+    end
+
+    test "empty key ids from the server are not requested from the phone", ctx do
+      phone_has_a_few(ctx.server)
+
+      list = %PatchList{
+        name: @name,
+        patches: [
+          %WAServerSync.SyncdPatch{keyID: %WAServerSync.KeyId{ID: <<>>}},
+          %WAServerSync.SyncdPatch{keyID: %WAServerSync.KeyId{ID: @key_id}}
+        ]
+      }
+
+      proc = Processor.new(@me, store: Memory)
+      assert Processor.missing_key_ids(proc, list) == [@key_id]
     end
 
     test "a corrupted patch is rejected, and the stored state does not move", ctx do
