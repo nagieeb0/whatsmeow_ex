@@ -1697,6 +1697,7 @@ defmodule Whatsmeow.Session do
             # that later decrypts votes on a poll. Dropping a spam message must
             # not silently break history sync.
             _ = maybe_start_history_sync(state, typed_msg, info)
+            _ = maybe_handle_app_state_key_share(state, typed_msg, info)
             _ = maybe_store_message_secret(state, typed_msg, info)
 
             # The receive pipeline runs before anything is broadcast, so a step
@@ -1961,6 +1962,56 @@ defmodule Whatsmeow.Session do
   rescue
     _ -> :ok
   end
+
+  # --- App-state sync keys --------------------------------------------------
+
+  # Our phone hands every linked device the keys app-state patches are
+  # encrypted under, in an `appStateSyncKeyShare` protocol message. Without
+  # them we can neither verify the account's app state nor send a patch
+  # (archive, mark read). Go's `handleAppStateSyncKeyShare`, gated like the
+  # rest of `handleProtocolMessage` on `info.IsFromMe`: a key from anyone else
+  # would let them decide what we accept as our own account's state.
+  defp maybe_handle_app_state_key_share(state, %{raw: raw}, info) do
+    with true <- info.is_from_me?,
+         %WAWebProtobufsE2E.AppStateSyncKeyShare{} = share <- app_state_key_share(raw) do
+      device_id = state.device_id
+
+      # Background, like history sync: storing then syncing every collection
+      # makes IQ round-trips that call back into this process.
+      Task.Supervisor.start_child(Whatsmeow.Media.TaskSup, fn ->
+        case Whatsmeow.AppState.handle_key_share(device_id, share) do
+          :ok ->
+            :ok
+
+          {:error, reason} ->
+            Logger.warning("[whatsmeow] app state key share not stored: #{inspect(reason)}",
+              device_id: device_id
+            )
+        end
+      end)
+    end
+
+    :ok
+  rescue
+    _ -> :ok
+  end
+
+  # Go unwraps `deviceSentMessage` before looking at protocol messages.
+  defp app_state_key_share(%WAWebProtobufsE2E.Message{
+         deviceSentMessage: %WAWebProtobufsE2E.DeviceSentMessage{
+           message: %WAWebProtobufsE2E.Message{} = inner
+         }
+       }),
+       do: app_state_key_share(inner)
+
+  defp app_state_key_share(%WAWebProtobufsE2E.Message{
+         protocolMessage: %WAWebProtobufsE2E.ProtocolMessage{
+           appStateSyncKeyShare: %WAWebProtobufsE2E.AppStateSyncKeyShare{} = share
+         }
+       }),
+       do: share
+
+  defp app_state_key_share(_), do: nil
 
   # `<receipt type="hist_sync" to="<our own jid>" id="<message id>"/>`.
   # Ports Go's `SendProtocolMessageReceipt` (`whatsmeow-main/message.go:853`).

@@ -13,14 +13,13 @@ defmodule Whatsmeow.AppState.Sync do
 
   * `build_fetch_patches_iq/3` — the `<iq>` builder
   * `parse_patch_list/1` — the response parser (`<sync><collection>` →
-    `%PatchList{}`)
+    `%PatchList{}`), leaving the snapshot as its `ExternalBlobReference`
+  * `parse_patch_list/2` / `parse_collection/2` — Go's `ParsePatchList`:
+    the same, with the snapshot and any external mutations downloaded
   * `fetch_patches/4` — live IQ round-trip via `Session.send_iq`
 
-  It does **not yet** ship the full `FetchAppState` loop (Go's
-  `cli.fetchAppState`): the apply-mutations step requires the
-  per-collection key store (`appstate.GetAppStateSyncKey`) plus the
-  event dispatch wiring that we'll land in a follow-up — but everything
-  here is the live-server-side prerequisite for that loop.
+  The fetch-and-apply loop, sending patches and the key store are
+  `Whatsmeow.AppState`.
 
   ## Patch names
 
@@ -186,6 +185,83 @@ defmodule Whatsmeow.AppState.Sync do
     end
   end
 
+  @doc """
+  Go's `ParsePatchList` on a whole response: find `<sync><collection>`, then
+  `parse_collection/2`.
+  """
+  @spec parse_patch_list(Node.t(), (struct() -> {:ok, binary()} | {:error, term()})) ::
+          {:ok, PatchList.t()} | {:error, term()}
+  def parse_patch_list(%Node{} = response, download) when is_function(download, 1) do
+    with {:ok, collection} <- extract_collection(response) do
+      parse_collection(collection, download)
+    end
+  end
+
+  @doc """
+  Parse one `<collection>` node the way Go's `ParsePatchList` does, with
+  `download.(%WAServerSync.ExternalBlobReference{})` fetching blobs:
+
+    * `<snapshot>` holds an `ExternalBlobReference`; the downloaded bytes are
+      a `SyncdSnapshot`, which becomes `:snapshot`;
+    * each `<patch>` is a `SyncdPatch`; when it carries `externalMutations`
+      the downloaded `SyncdMutations` replace its mutations (an empty
+      download is an error, as in Go).
+
+  Used for fetch responses and for the patches a 409 conflict returns.
+  """
+  @spec parse_collection(Node.t(), (struct() -> {:ok, binary()} | {:error, term()})) ::
+          {:ok, PatchList.t()} | {:error, term()}
+  def parse_collection(%Node{tag: "collection"} = collection, download)
+      when is_function(download, 1) do
+    with {:ok, snapshot} <- download_snapshot(Node.get_child(collection, "snapshot"), download),
+         patches when is_list(patches) <- patches_from_node(Node.get_child(collection, "patches")),
+         {:ok, patches} <- expand_external(patches, download) do
+      {:ok,
+       %PatchList{
+         name: Node.attr(collection, "name") || "",
+         has_more_patches?: truthy?(Node.attr(collection, "has_more_patches")),
+         patches: patches,
+         snapshot: snapshot
+       }}
+    end
+  end
+
+  defp download_snapshot(%Node{content: bin}, download) when is_binary(bin) do
+    with {:ok, ref} <- safe_decode(WAServerSync.ExternalBlobReference, bin),
+         {:ok, raw} <- wrap_download(download.(ref)) do
+      safe_decode(WAServerSync.SyncdSnapshot, raw)
+    end
+  end
+
+  defp download_snapshot(_, _download), do: {:ok, nil}
+
+  defp expand_external(patches, download) do
+    patches
+    |> Enum.reduce_while({:ok, []}, fn
+      %WAServerSync.SyncdPatch{externalMutations: %WAServerSync.ExternalBlobReference{} = ref} = p,
+      {:ok, acc} ->
+        with {:ok, raw} <- wrap_download(download.(ref)),
+             {:ok, %WAServerSync.SyncdMutations{mutations: [_ | _] = muts}} <-
+               safe_decode(WAServerSync.SyncdMutations, raw) do
+          {:cont, {:ok, [%{p | mutations: muts} | acc]}}
+        else
+          {:ok, %WAServerSync.SyncdMutations{}} -> {:halt, {:error, :empty_external_mutations}}
+          {:error, _} = err -> {:halt, err}
+        end
+
+      p, {:ok, acc} ->
+        {:cont, {:ok, [p | acc]}}
+    end)
+    |> case do
+      {:ok, list} -> {:ok, Enum.reverse(list)}
+      err -> err
+    end
+  end
+
+  defp wrap_download({:ok, bin}) when is_binary(bin), do: {:ok, bin}
+  defp wrap_download({:error, reason}), do: {:error, {:download_failed, reason}}
+  defp wrap_download(other), do: {:error, {:download_failed, other}}
+
   # --- Internals -------------------------------------------------------------
 
   defp extract_collection(response) do
@@ -206,11 +282,16 @@ defmodule Whatsmeow.AppState.Sync do
   defp patches_from_node(%Node{} = patches_node) do
     patches_node
     |> Node.get_children("patch")
-    |> Enum.reduce_while([], fn %Node{content: bin}, acc when is_binary(bin) ->
-      case safe_decode(WAServerSync.SyncdPatch, bin) do
-        {:ok, p} -> {:cont, [p | acc]}
-        {:error, _} = err -> {:halt, err}
-      end
+    |> Enum.reduce_while([], fn
+      %Node{content: bin}, acc when is_binary(bin) ->
+        case safe_decode(WAServerSync.SyncdPatch, bin) do
+          {:ok, p} -> {:cont, [p | acc]}
+          {:error, _} = err -> {:halt, err}
+        end
+
+      # Go skips a <patch> without bytes rather than failing the list.
+      _, acc ->
+        {:cont, acc}
     end)
     |> case do
       list when is_list(list) -> Enum.reverse(list)
