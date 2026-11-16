@@ -324,7 +324,9 @@ defmodule Whatsmeow.AppState do
 
   defp handle_send_error(ctx, %Patch{type: name} = patch, state, collection, allow_retry?, opts) do
     error = Node.get_child(collection, "error")
-    code = error && Node.attr(error, "code")
+    # The binary decoder may hand an attribute back as an integer; Go reads
+    # it with `AttrGetter().Int("code")`.
+    code = error && to_string(Node.attr(error, "code"))
     reason = {:app_state_update_failed, name, code, error && Node.attr(error, "text")}
 
     if code == "409" and allow_retry? do

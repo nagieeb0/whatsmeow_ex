@@ -344,7 +344,8 @@ defmodule Whatsmeow.AppStateFake do
       sent_version != c.state.version ->
         missing = Enum.filter(c.patches, &(&1.version.version > sent_version))
         s = %{s | sends: s.sends ++ [{:conflict, patch}]}
-        {result(iq, error_collection(name, "409", "conflict", [patches_node(missing)])), s}
+        # An integer attribute, as the binary decoder can produce.
+        {result(iq, error_collection(name, 409, "conflict", [patches_node(missing)])), s}
 
       (reason = verify_as_other_device(s, c, name, patch)) != :ok ->
         s = %{s | sends: s.sends ++ [{:rejected, reason, patch}]}
